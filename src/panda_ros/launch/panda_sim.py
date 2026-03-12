@@ -86,6 +86,15 @@ def launch_setup(context, *args, **kwargs):
         )
     )
 
+    nodes.append(
+        Node(
+            package="panda_ros",
+            executable="panda_test_node",
+            output="both",
+            on_exit=Shutdown(),
+        )
+    )
+
     # ros2_control node with MuJoCo - PID gains loaded from mujoco_pid.yaml
     nodes.append(
         Node(

@@ -5,3 +5,4 @@ src/mujoco_ros2_control
 *.obj
 *.stl
 *.dae
+.vscode

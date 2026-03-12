@@ -8,10 +8,14 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 find_package(pinocchio REQUIRED)
 find_package(mujoco REQUIRED)
 find_package(glfw3 REQUIRED)
+
+include_directories(/home/cyh/panda_ros2/src/panda_ros/include/panda_ros)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -25,9 +29,14 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-add_executable(panda_test_node src/panda_test_node.cpp)
+add_executable(panda_test_node 
+  src/panda_test_node.cpp
+  src/pinoSolver.cpp
+)
 ament_target_dependencies(panda_test_node
   rclcpp
+  std_msgs
+  sensor_msgs
 )
 
 target_link_libraries(panda_test_node 
@@ -46,6 +55,14 @@ install(DIRECTORY
   launch
   model
   DESTINATION share/${PROJECT_NAME}
+)
+
+add_executable(test_node src/test_node.cpp)
+ament_target_dependencies(test_node
+  rclcpp
+)
+install(TARGETS test_node
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()
