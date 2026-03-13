@@ -184,3 +184,25 @@ Eigen::VectorXd pinoSolver::impedanceControlSolver(const Eigen::Vector3d& target
 
     return tau_total;
 }
+
+Eigen::Vector2d pinoSolver::getYoshikawaManipulabilityMeasure(const Eigen::VectorXd& jq_curr) 
+{
+    pinocchio::computeJointJacobians(model, data, jq_curr);
+    pinocchio::updateFramePlacements(model, data);
+
+    Eigen::Matrix<double, 6, Eigen::Dynamic> J(6, model.nv);
+    J.setZero();
+    pinocchio::getFrameJacobian(model, data, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J);
+
+    Eigen::Matrix<double, 3, Eigen::Dynamic> J_v = J.topRows<3>();
+    Eigen::Matrix<double, 3, Eigen::Dynamic> J_w = J.bottomRows<3>();
+
+    Eigen::Vector2d mani_measure;
+
+    double m_v = std::sqrt(std::max(0.0, (J_v * J_v.transpose()).determinant())); // m/s
+    double m_w = std::sqrt(std::max(0.0, (J_w * J_w.transpose()).determinant())); // rad/s
+
+    mani_measure << m_v, m_w;
+
+    return mani_measure;
+}

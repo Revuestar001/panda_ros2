@@ -47,6 +47,9 @@ private:
         // // RCLCPP_INFO(this->get_logger(), "Publish effort message");
         // effort_pub_->publish(msg);
         
+        auto mani_meas = solver_.getYoshikawaManipulabilityMeasure(jq_);
+        RCLCPP_INFO(this->get_logger(), "Yoshikawa Manipulability Measure : %lf, %lf", mani_meas[0], mani_meas[1]);
+        
     }
 
     void joint_states_callback(const sensor_msgs::msg::JointState::SharedPtr msg) {
@@ -89,7 +92,7 @@ public:
 
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>("/joint_states", 10, [this] (const sensor_msgs::msg::JointState::SharedPtr msg) {this->joint_states_callback(msg);});
         effort_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/effort_controller/commands", 1);
-        timer_ = this->create_wall_timer(std::chrono::milliseconds(2), [this] () {this->timer_effort_cmd_callback();});
+        timer_ = this->create_wall_timer(std::chrono::milliseconds(500), [this] () {this->timer_effort_cmd_callback();});
     }
 
     ~panda_test_node() {}
