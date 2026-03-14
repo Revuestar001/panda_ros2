@@ -49,6 +49,12 @@ private:
         
         auto mani_meas = solver_.getYoshikawaManipulabilityMeasure(jq_);
         RCLCPP_INFO(this->get_logger(), "Yoshikawa Manipulability Measure : %lf, %lf", mani_meas[0], mani_meas[1]);
+
+        auto min_sin = solver_.getMinSingularValue(jq_);
+        RCLCPP_INFO(this->get_logger(), "Min Singular Value : %lf", min_sin);
+
+        auto condi_num = solver_.getConditionNumber(jq_);
+        RCLCPP_INFO(this->get_logger(), "Condition Number : %lf", condi_num);
         
     }
 

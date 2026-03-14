@@ -170,7 +170,7 @@ Eigen::VectorXd pinoSolver::impedanceControlSolver(const Eigen::Vector3d& target
     const double d_null = 2.0 * std::sqrt(k_null);
 
     // -k_null是因为我们要把正梯度变为负梯度，下降最快
-    Eigen::Matrix<double, 7, 1> tau_null_desired = M_arm * (-0.0 * k_null * grad_q - d_null * jv_curr.head<7>());
+    Eigen::Matrix<double, 7, 1> tau_null_desired = M_arm * (-1.0 * k_null * grad_q - 1.0 * d_null * jv_curr.head<7>());
     Eigen::Matrix<double, 7, 1> tau_null = N_dyn.transpose() * (tau_null_desired + nonlinear_terms);
 
     Eigen::Matrix<double, 7, 1> tau_arm = tau_task + tau_null;
@@ -205,4 +205,42 @@ Eigen::Vector2d pinoSolver::getYoshikawaManipulabilityMeasure(const Eigen::Vecto
     mani_measure << m_v, m_w;
 
     return mani_measure;
+}
+
+double pinoSolver::getMinSingularValue(const Eigen::VectorXd& jq_curr) {
+    pinocchio::computeJointJacobians(model, data, jq_curr);
+    pinocchio::updateFramePlacements(model, data);
+
+    Eigen::Matrix<double, 6, Eigen::Dynamic> J(6, model.nv);
+    J.setZero();
+    pinocchio::getFrameJacobian(model, data, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J);
+
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(J);
+
+    // Eigen 默认会将奇异值按降序排列存储在向量中
+    // 使用 minCoeff() 安全地提取最小的一个
+    return svd.singularValues().minCoeff();
+}
+
+double pinoSolver::getConditionNumber(const Eigen::VectorXd& jq_curr) {
+    pinocchio::computeJointJacobians(model, data, jq_curr);
+    pinocchio::updateFramePlacements(model, data);
+
+    Eigen::Matrix<double, 6, Eigen::Dynamic> J(6, model.nv);
+    J.setZero();
+    pinocchio::getFrameJacobian(model, data, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J);
+
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(J);
+    Eigen::VectorXd sv = svd.singularValues();
+    
+    double max_sv = sv.maxCoeff();
+    double min_sv = sv.minCoeff();
+
+    // 如果最小奇异值极小，说明矩阵已经完全降秩（彻底卡死）
+    // 此时条件数趋于无穷大
+    if (min_sv < 1e-7) {
+        return std::numeric_limits<double>::infinity();
+    }
+    
+    return max_sv / min_sv;
 }

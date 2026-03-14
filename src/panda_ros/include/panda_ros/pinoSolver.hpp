@@ -62,6 +62,10 @@ public:
 
     Eigen::Vector2d getYoshikawaManipulabilityMeasure(const Eigen::VectorXd& jq_curr);
 
+    double getMinSingularValue(const Eigen::VectorXd& jq_curr);
+
+    double getConditionNumber(const Eigen::VectorXd& jq_curr);
+
     int getNumJoints() const { return model.nv; }
 
     pinocchio::Model& getPinocchioModel() { return model; }
