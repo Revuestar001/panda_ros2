@@ -2,6 +2,7 @@ build
 install
 log
 src/mujoco_ros2_control
+src/moveit_test
 *.obj
 *.stl
 *.dae
