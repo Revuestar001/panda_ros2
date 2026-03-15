@@ -74,6 +74,16 @@ private:
         }
 
         Eigen::VectorXd torque = solver_.impedanceControlSolver(target_pos_, target_rot_, target_vel_, target_acc_, jq_, jv_, false);
+        
+        // Eigen::Vector<double, 7> target_jq;
+        // target_jq << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        // Eigen::Vector<double, 7> jq = [this] () {return jq_.head<7>();} ();
+        // Eigen::Vector<double, 7> jv = [this] () {return jv_.head<7>();} ();
+        // auto torque = solver_.cSpaceImpedanceControlSolver<7>(target_jq, 
+        //                                                     Eigen::Vector<double, 7>::Zero(),
+        //                                                     Eigen::Vector<double, 7>::Zero(),
+        //                                                     jq,
+        //                                                     jv);
 
         auto effort_msg = std_msgs::msg::Float64MultiArray();
         for (size_t i = 0; i < ordered_names_.size(); ++i) {

@@ -94,6 +94,34 @@ Eigen::VectorXd pinoSolver::CLIKSolve(const Eigen::Vector3d& target_pos,
     return q;
 }
 
+template <int T>
+Eigen::Vector<double, T> pinoSolver::cSpaceImpedanceControlSolver(const Eigen::Vector<double, T>& target_jq,
+                                                                    const Eigen::Vector<double, T>& target_jv,
+                                                                    const Eigen::Vector<double, T>& target_ja,
+                                                                    const Eigen::Vector<double, T>& jq_curr, 
+                                                                    const Eigen::Vector<double, T>& jv_curr)
+{
+    pinocchio::computeAllTerms(model, data, jq_curr, jv_curr);
+    Eigen::Matrix<double, T, T> M_arm = data.M.topLeftCorner<T, T>();
+    Eigen::Vector<double, T> nonlinear_terms = data.nle.head<T>();
+
+    Eigen::Matrix<double, T, T> C_d = Eigen::Matrix<double, T, T>::Zero();
+    Eigen::Matrix<double, T, T> K_d = Eigen::Matrix<double, T, T>::Zero();
+    C_d = M_arm * desire_joints_damp;
+    K_d = M_arm * desire_joints_stiff;
+
+    Eigen::Vector<double, T> jq_err = target_jq - jq_curr;
+    Eigen::Vector<double, T> jv_err = target_jv - jv_curr;
+
+    auto tau = M_arm * target_ja + C_d * jv_err + K_d * jq_err + nonlinear_terms;
+
+    return tau;
+}
+template Eigen::Vector<double, 7> pinoSolver::cSpaceImpedanceControlSolver<7>(
+    const Eigen::Vector<double, 7>&, const Eigen::Vector<double, 7>&, 
+    const Eigen::Vector<double, 7>&, const Eigen::Vector<double, 7>&, 
+    const Eigen::Vector<double, 7>&);
+
 Eigen::VectorXd pinoSolver::impedanceControlSolver(const Eigen::Vector3d& target_pos, 
                                                    const Eigen::Matrix3d& target_rot,
                                                    const Eigen::VectorXd& target_vel_twist,
@@ -116,6 +144,7 @@ Eigen::VectorXd pinoSolver::impedanceControlSolver(const Eigen::Vector3d& target
     Eigen::MatrixXd J_dot_lwa = J_full_dot_lwa.leftCols(7);
     Eigen::MatrixXd J_T_lwa = J_lwa.transpose();
 
+    // 注意误差定义为 期望 - 实际
     pinocchio::SE3 X_ee_sb = data.oMf[ee_frame_id];
     pinocchio::SE3 X_ee_sd(target_rot, target_pos);
     auto X_err_bd = X_ee_sb.actInv(X_ee_sd);
@@ -163,14 +192,14 @@ Eigen::VectorXd pinoSolver::impedanceControlSolver(const Eigen::Vector3d& target
     // 当然，在这里和PD控制器没有本质区别，但是可以推广到其他形式的势能函数
     Eigen::Matrix<double, 7, 1> grad_q = Eigen::Matrix<double, 7, 1>::Zero();
     for(int i = 0; i < 7; ++i) {
-        grad_q(i) = (jq_curr(i) - q_mean(i)) / std::pow((q_max(i) - q_min(i)), 2);
+        grad_q(i) = (q_mean(i) - jq_curr(i)) / std::pow((q_max(i) - q_min(i)), 2);
     }
 
     const double k_null = 20.0;
     const double d_null = 2.0 * std::sqrt(k_null);
 
     // -k_null是因为我们要把正梯度变为负梯度，下降最快
-    Eigen::Matrix<double, 7, 1> tau_null_desired = M_arm * (-1.0 * k_null * grad_q - 1.0 * d_null * jv_curr.head<7>());
+    Eigen::Matrix<double, 7, 1> tau_null_desired = M_arm * (1.0 * k_null * grad_q - 1.0 * d_null * jv_curr.head<7>());
     Eigen::Matrix<double, 7, 1> tau_null = N_dyn.transpose() * (tau_null_desired + nonlinear_terms);
 
     Eigen::Matrix<double, 7, 1> tau_arm = tau_task + tau_null;

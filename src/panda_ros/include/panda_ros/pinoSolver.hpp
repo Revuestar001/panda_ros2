@@ -28,12 +28,16 @@ private:
     Eigen::VectorXd q_max;
     Eigen::VectorXd q_mean;
 
-    // impedance Control 
+    // cartesian impedance Control 
     const double lamda_damp = 1e-6;
     const double desire_pos_damp = 50.0;
     const double desire_rot_damp = 5.0;
     const double desire_pos_stiff = 500.0;
     const double desire_rot_stiff = 50.0;
+
+    // c-space impedance Control 
+    const double desire_joints_damp = 50.0;
+    const double desire_joints_stiff = 500.0;
 
 public:
     pinoSolver(const std::string& urdf_path, const std::string& ee_frame_name);
@@ -50,6 +54,13 @@ public:
                           const Eigen::Matrix3d& target_rot, 
                           const Eigen::VectorXd& q_init, 
                           bool& success);
+
+    template <int T>
+    Eigen::Vector<double, T> cSpaceImpedanceControlSolver(const Eigen::Vector<double, T>& target_jq,
+                                                                        const Eigen::Vector<double, T>& target_jv,
+                                                                        const Eigen::Vector<double, T>& target_ja,
+                                                                        const Eigen::Vector<double, T>& jq_curr, 
+                                                                        const Eigen::Vector<double, T>& jv_curr);
 
 
     Eigen::VectorXd impedanceControlSolver(const Eigen::Vector3d& target_pos, 

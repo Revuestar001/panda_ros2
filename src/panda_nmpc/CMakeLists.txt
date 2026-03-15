@@ -46,7 +46,9 @@ find_library(SOLVER_LIB acados_solver_panda_task_space_nmpc PATHS ${GEN_CODE_DIR
 # ===================================================================
 
 # 2. 编译可执行文件
-add_executable(nmpc_tau src/nmpc_tau.cpp)
+add_executable(nmpc_tau 
+  src/nmpc_tau.cpp
+)
 
 # 包含所有的头文件路径
 target_include_directories(nmpc_tau PUBLIC
