@@ -10,7 +10,7 @@
 #include "acados_c/ocp_nlp_interface.h"
 #include "acados_c/external_function_interface.h"
 
-#include "c_generated_code/acados_solver_panda_task_space_nmpc.h"
+#include "acados_solver_panda_task_space_nmpc.h"
 
 #include "panda_nmpc_controller.hpp"
 

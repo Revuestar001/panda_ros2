@@ -13,7 +13,7 @@
 #include "acados_c/external_function_interface.h"
 
 // 引入自动生成的 Panda 任务空间 NMPC 专属头文件
-#include "c_generated_code/acados_solver_panda_task_space_nmpc.h"
+#include "acados_solver_panda_task_space_nmpc.h"
 
 class PandaNMPCController {
 public:

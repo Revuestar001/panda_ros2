@@ -21,7 +21,7 @@ if(NOT ACADOS_DIR)
 endif()
 
 # 指定自动生成的 C 代码所在目录 (假设 c_generated_code 放在当前 package 的根目录)
-set(GEN_CODE_DIR /home/cyh/nmpc_model_gen)
+set(GEN_CODE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/nmpc_model_gen)
 
 # 设置 Acados 相关的头文件路径
 set(ACADOS_INCLUDE_DIRS
@@ -29,7 +29,7 @@ set(ACADOS_INCLUDE_DIRS
   ${ACADOS_DIR}/include/acados
   ${ACADOS_DIR}/include/blasfeo/include
   ${ACADOS_DIR}/include/hpipm/include
-  ${GEN_CODE_DIR}
+  ${GEN_CODE_DIR}/c_generated_code
 )
 
 include_directories(/home/cyh/panda_ros2/src/panda_nmpc/include/panda_nmpc)
@@ -41,7 +41,7 @@ find_library(BLASFEO_LIB blasfeo PATHS ${ACADOS_DIR}/lib REQUIRED)
 
 # 查找你刚刚生成的求解器动态库 (需提前在 c_generated_code 目录下执行 make shared_lib)
 # 注意：库的名字必须和你在 Python 里设定的 acados_model.name 匹配
-find_library(SOLVER_LIB acados_solver_panda_task_space_nmpc PATHS ${GEN_CODE_DIR} REQUIRED)
+find_library(SOLVER_LIB acados_solver_panda_task_space_nmpc PATHS ${GEN_CODE_DIR}/c_generated_code REQUIRED)
 
 # ===================================================================
 
@@ -92,7 +92,7 @@ install(DIRECTORY
 )
 
 # 安装自动生成的动态库，确保 ROS 2 install 空间里有 .so 文件可用
-install(DIRECTORY ${GEN_CODE_DIR}/
+install(DIRECTORY ${GEN_CODE_DIR}/c_generated_code/
   DESTINATION lib/${PROJECT_NAME}/c_generated_code
   FILES_MATCHING PATTERN "*.so"
 )

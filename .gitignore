@@ -7,3 +7,5 @@ src/moveit_test
 *.stl
 *.dae
 .vscode
+src/panda_nmpc/nmpc_model_gen/build
+src/panda_nmpc/nmpc_model_gen/c_generated_code
