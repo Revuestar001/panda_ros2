@@ -19,7 +19,7 @@
 
 控制目标
 --------
-- 任务: 笛卡尔空间末端位姿跟踪（位置 + 姿态）
+- 任务: 笛卡尔空间末端位置跟踪（只跟踪位置，不跟踪姿态）
 - 机器人: Franka Panda 7 自由度机械臂（不考虑夹爪）
 - 末端 frame: 默认使用 "ee_center_body"，可通过命令行修改
 
@@ -36,30 +36,35 @@
 --------
 1) 本 OCP 不直接把“力矩”作为控制输入，因此适合外部再接高频内环
    （joint position / velocity / impedance / inverse dynamics inner loop）。
-2) 力矩 tau 通过 Pinocchio 的 RNEA(q, dq, ddq) 在线计算，并作为非线性路径约束加入 OCP。
-3) 因此可以同时约束：
+2) 当前版本已经**去掉姿态误差项**，只做末端位置跟踪。
+3) 力矩 tau 的 RNEA 约束也继续保持注释状态，便于先验证位置版 jerk-NMPC 是否稳定。
+4) 因此当前版本实际约束：
    - 关节角
    - 关节速度
    - 关节加速度
-   - 力矩
    - jerk
-4) 运行时的参考位姿和舒适姿态通过参数 p 传入，但本脚本只负责“定义参数结构”，
+5) 运行时的参考位置和舒适姿态通过参数 p 传入，但本脚本只负责“定义参数结构”，
    不负责在线设置 p。
 
 运行时参数定义
 --------------
 每个 shooting node 的参数为：
     p = [p_des(3), R_des_col_major(9), q_nom(7)] ∈ R^19
+
+说明：
+- 为了尽量少改你现有 C++ 节点接口，这里仍然保留 R_des 的 9 维参数位。
+- 但当前版本**不会在 cost 中使用 R_des**。
+- 也就是说，在线节点的参数打包接口可以暂时不改，仍然按 19 维传参。
+
 其中：
 - p_des           : 末端期望位置
-- R_des_col_major : 末端期望旋转矩阵（按列优先展开）
+- R_des_col_major : 末端期望旋转矩阵（按列优先展开，当前版本未使用）
 - q_nom           : 关节正则化参考（舒适姿态）
 
 代价函数
 --------
 stage cost:
     || p_ee(q) - p_des ||^2_{W_pos}
-  + || log3(R_ee(q) * R_des^T) ||^2_{W_rot}
   + || q   - q_nom ||^2_{W_q}
   + || dq          ||^2_{W_dq}
   + || ddq         ||^2_{W_ddq}
@@ -131,17 +136,15 @@ class PandaLimits:
 
 @dataclass
 class WeightConfig:
-    """代价函数权重。"""
+    """代价函数权重（当前版本不包含姿态权重）。"""
 
     pos: np.ndarray = field(default_factory=lambda: np.array([500.0, 500.0, 500.0], dtype=float))
-    rot: np.ndarray = field(default_factory=lambda: np.array([200.0, 200.0, 200.0], dtype=float))
     q_reg: np.ndarray = field(default_factory=lambda: np.array([2.0] * 7, dtype=float))
     dq_reg: np.ndarray = field(default_factory=lambda: np.array([0.3] * 7, dtype=float))
     ddq_reg: np.ndarray = field(default_factory=lambda: np.array([0.03] * 7, dtype=float))
     jerk_reg: np.ndarray = field(default_factory=lambda: np.array([1.0e-4] * 7, dtype=float))
 
     pos_e: np.ndarray = field(default_factory=lambda: np.array([1200.0, 1200.0, 1200.0], dtype=float))
-    rot_e: np.ndarray = field(default_factory=lambda: np.array([500.0, 500.0, 500.0], dtype=float))
     q_reg_e: np.ndarray = field(default_factory=lambda: np.array([3.0] * 7, dtype=float))
     dq_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.4] * 7, dtype=float))
     ddq_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.05] * 7, dtype=float))
@@ -155,13 +158,13 @@ class OcpConfig:
     horizon_steps: int = 20
 
     # 代码导出配置
-    solver_name: str = "panda_pose_jerk_nmpc"
+    solver_name: str = "panda_task_space_nmpc"
     json_file: str = "acados_panda_pose_jerk_nmpc.json"
-    code_export_dir: str = "c_generated_code_panda_pose_jerk_nmpc"
+    code_export_dir: str = "c_generated_code"
 
     # acados 求解器配置（用于生成 C solver）
     nlp_solver_type: str = "SQP"
-    qp_solver: str = "PARTIAL_CONDENSING_HPIPM"
+    qp_solver: str = "FULL_CONDENSING_HPIPM"
     hessian_approx: str = "GAUSS_NEWTON"
     integrator_type: str = "ERK"
     sim_method_num_stages: int = 4
@@ -185,24 +188,28 @@ class OcpConfig:
 
     @property
     def np_stage(self) -> int:
+        # 仍保持 19 维参数，兼容你现有节点接口：
+        # p = [p_des(3), R_des(9), q_nom(7)]
         return 19
 
     @property
     def ny(self) -> int:
-        return 34
+        # pos_err(3) + q_reg(7) + dq_reg(7) + ddq_reg(7) + jerk_reg(7)
+        return 31
 
     @property
     def ny_e(self) -> int:
-        return 27
+        # pos_err(3) + q_reg(7) + dq_reg(7) + ddq_reg(7)
+        return 24
 
     def stage_weight_matrix(self) -> np.ndarray:
         w = self.weights
-        diag = np.concatenate([w.pos, w.rot, w.q_reg, w.dq_reg, w.ddq_reg, w.jerk_reg])
+        diag = np.concatenate([w.pos, w.q_reg, w.dq_reg, w.ddq_reg, w.jerk_reg])
         return np.diag(diag)
 
     def terminal_weight_matrix(self) -> np.ndarray:
         w = self.weights
-        diag = np.concatenate([w.pos_e, w.rot_e, w.q_reg_e, w.dq_reg_e, w.ddq_reg_e])
+        diag = np.concatenate([w.pos_e, w.q_reg_e, w.dq_reg_e, w.ddq_reg_e])
         return np.diag(diag)
 
     def state_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -271,9 +278,10 @@ def build_symbolic_problem(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -
     jerk = ca.SX.sym("jerk", 7, 1)
 
     # p = [p_des(3), R_des(9, col-major), q_nom(7)]
+    # 当前版本虽然保留 R_des 的参数位，但不在代价中使用它。
     p = ca.SX.sym("p", cfg.np_stage, 1)
     p_des = p[0:3]
-    R_des = ca.reshape(p[3:12], 3, 3)
+    _R_des_unused = ca.reshape(p[3:12], 3, 3)  # 仅为保持参数接口兼容
     q_nom = p[12:19]
 
     # 连续时间模型
@@ -283,31 +291,32 @@ def build_symbolic_problem(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -
     # 末端位姿
     cpin.framesForwardKinematics(cmodel, cdata, q)
     ee_pos = cdata.oMf[ee_frame_id].translation
-    ee_rot = cdata.oMf[ee_frame_id].rotation
+    # ee_rot = cdata.oMf[ee_frame_id].rotation  # 当前版本不使用姿态误差
 
-    # 位姿误差
+    # 只保留末端位置误差
     pos_err = ee_pos - p_des
-    rot_err = cpin.log3(ee_rot @ R_des.T)
 
-    # 力矩路径约束: tau(q, dq, ddq)
-    tau = cpin.rnea(cmodel, cdata, q, dq, ddq)
+    # 如需恢复姿态误差，可取消下面两行注释
+    # rot_err = cpin.log3(ee_rot @ R_des.T)
+    # 并把它重新拼回 cost_y / cost_y_e，同时恢复 ny / ny_e 和权重矩阵
 
-    # NONLINEAR_LS 输出向量
+    # 力矩路径约束（当前版本继续注释）
+    # tau = cpin.rnea(cmodel, cdata, q, dq, ddq)
+
+    # NONLINEAR_LS 输出向量（无姿态项）
     cost_y = ca.vertcat(
-        pos_err,
-        rot_err,
-        q - q_nom,
-        dq,
-        ddq,
-        jerk,
+        pos_err,    # 3
+        q - q_nom,  # 7
+        dq,         # 7
+        ddq,        # 7
+        jerk,       # 7
     )
 
     cost_y_e = ca.vertcat(
-        pos_err,
-        rot_err,
-        q - q_nom,
-        dq,
-        ddq,
+        pos_err,    # 3
+        q - q_nom,  # 7
+        dq,         # 7
+        ddq,        # 7
     )
 
     return {
@@ -321,8 +330,8 @@ def build_symbolic_problem(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -
         "f_impl": f_impl,
         "cost_y": cost_y,
         "cost_y_e": cost_y_e,
-        "h": tau,
-        "h_e": tau,
+        # "h": tau,
+        # "h_e": tau,
     }
 
 
@@ -348,7 +357,6 @@ def build_acados_model(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Ac
     # model.con_h_expr = sym["h"]
     # model.con_h_expr_e = sym["h_e"]
     return model
-
 
 
 def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> AcadosOcp:
@@ -389,7 +397,7 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
     ocp.constraints.lbu = -lim.dddq_max
     ocp.constraints.ubu = lim.dddq_max
 
-    # 非线性约束：tau = RNEA(q, dq, ddq)
+    # 非线性约束：tau = RNEA(q, dq, ddq)（当前版本继续注释）
     # ocp.constraints.lh = -lim.tau_max
     # ocp.constraints.uh = lim.tau_max
     # ocp.constraints.lh_e = -lim.tau_max
@@ -486,7 +494,7 @@ def make_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--code-export-dir",
         type=str,
-        default="c_generated_code_panda_pose_jerk_nmpc",
+        default="c_generated_code",
         help="生成的 acados C 工程导出目录",
     )
     parser.add_argument(

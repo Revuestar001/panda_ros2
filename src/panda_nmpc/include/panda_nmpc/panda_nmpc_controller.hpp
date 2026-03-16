@@ -15,6 +15,10 @@
 // 引入自动生成的 Panda Advanced NMPC 专属头文件 (与 Python 生成的 name 保持一致)
 #include "acados_solver_panda_task_space_nmpc.h"
 
+#include <pinocchio/parsers/urdf.hpp>
+#include <pinocchio/algorithm/frames.hpp>
+#include <pinocchio/algorithm/kinematics.hpp>
+
 // 定义 NMPC 的输出结构体，方便 ROS 2 节点调用和对接阻抗控制器
 struct NMPCResult {
     Eigen::Matrix<double, 7, 1> q_ref;     // 下一步的参考关节角
@@ -26,10 +30,11 @@ struct NMPCResult {
 
 class PandaNMPCController {
 public:
-    PandaNMPCController() {
+    PandaNMPCController(const std::string& urdf_path,
+                    const std::string& ee_frame_name)
+    {
         std::cout << "[Panda Advanced NMPC] 正在初始化 SOTA Acados 求解器..." << std::endl;
 
-        // 1. 创建求解器胶囊
         capsule_ = panda_task_space_nmpc_acados_create_capsule();
         int status = panda_task_space_nmpc_acados_create(capsule_);
         if (status) {
@@ -37,16 +42,13 @@ public:
             throw std::runtime_error("Acados solver initialization failed");
         }
 
-        // 2. 获取核心指针 
         nlp_config_ = panda_task_space_nmpc_acados_get_nlp_config(capsule_);
         nlp_dims_   = panda_task_space_nmpc_acados_get_nlp_dims(capsule_);
         nlp_in_     = panda_task_space_nmpc_acados_get_nlp_in(capsule_);
         nlp_out_    = panda_task_space_nmpc_acados_get_nlp_out(capsule_);
 
-        N_ = nlp_dims_->N; // 预测视野 (对应 Python 中的 N_horizon = 40)
+        N_ = nlp_dims_->N;
 
-        // 初始化预测视野的代价残差全为 0 
-        // (因为我们在 CasADi 内部计算了 pos_error, ori_error, 目标就是让它们趋近于 0)
         std::memset(y_ref_, 0, sizeof(y_ref_));
         std::memset(y_ref_e_, 0, sizeof(y_ref_e_));
 
@@ -54,6 +56,11 @@ public:
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_);
         }
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e_);
+
+        // 用同一个 URDF / frame 初始化 Pinocchio
+        pinocchio::urdf::buildModel(urdf_path, pin_model_);
+        pin_data_ = pinocchio::Data(pin_model_);
+        ee_frame_id_ = pin_model_.getFrameId(ee_frame_name);
 
         std::cout << "[Panda Advanced NMPC] 求解器初始化成功! 预测步数 N = " << N_ << std::endl;
     }
@@ -85,6 +92,26 @@ public:
         const Eigen::VectorXd& current_v,
         const Eigen::VectorXd& current_a
     ) {
+        // Eigen::Vector3d fk_pos;
+        // Eigen::Matrix3d fk_rot;
+        // computeCurrentEEPose(current_q, fk_pos, fk_rot);
+
+        // std::cout << "FK current pos = " << fk_pos.transpose() << std::endl;
+        // std::cout << "target pos     = " << target_pos.transpose() << std::endl;
+        // std::cout << "pos err norm    = " << (fk_pos - target_pos).norm() << std::endl;
+
+        // Eigen::Matrix3d R_err = fk_rot * target_rot.transpose();
+        // double tr = std::max(-1.0, std::min(3.0, (R_err.trace() - 1.0) * 0.5));
+        // double ang = std::acos(std::max(-1.0, std::min(1.0, tr)));
+        // std::cout << "rot err angle   = " << ang << std::endl;
+        Eigen::Vector3d fk_pos;
+        Eigen::Matrix3d fk_rot;
+        computeCurrentEEPose(current_q, fk_pos, fk_rot);
+
+        // 临时测试：强制目标=当前位姿
+        const Eigen::Vector3d& target_pos_used = fk_pos;
+        const Eigen::Matrix3d& target_rot_used = fk_rot;
+
         NMPCResult result;
         result.status = -1;
 
@@ -118,6 +145,33 @@ public:
             panda_task_space_nmpc_acados_update_params(capsule_, i, p_data, PANDA_TASK_SPACE_NMPC_NP);
         }
 
+        resetWarmStart(current_q, current_v, current_a);
+
+        static bool printed_once = false;
+        if (!printed_once) {
+            std::cout << "\n===== NMPC DEBUG ONCE =====" << std::endl;
+            std::cout << "current_q = " << current_q.transpose() << std::endl;
+            std::cout << "current_v = " << current_v.transpose() << std::endl;
+            std::cout << "current_a = " << current_a.transpose() << std::endl;
+            std::cout << "reference_q = " << reference_q.transpose() << std::endl;
+
+            std::cout << "target_pos = "
+                    << p_data[0] << ", "
+                    << p_data[1] << ", "
+                    << p_data[2] << std::endl;
+
+            std::cout << "target_rot(col-major) = ";
+            for (int i = 3; i < 12; ++i) std::cout << p_data[i] << " ";
+            std::cout << std::endl;
+
+            std::cout << "q_nom = ";
+            for (int i = 12; i < 19; ++i) std::cout << p_data[i] << " ";
+            std::cout << std::endl;
+
+            std::cout << "===========================" << std::endl;
+            printed_once = true;
+        }
+
         // 4. 调用 Acados RTI 求解器进行一步极速优化
         result.status = panda_task_space_nmpc_acados_solve(capsule_);
 
@@ -145,6 +199,18 @@ public:
         return result;
     }
 
+    void computeCurrentEEPose(const Eigen::Matrix<double, 7, 1>& q,
+                          Eigen::Vector3d& pos,
+                          Eigen::Matrix3d& rot)
+    {
+        pinocchio::forwardKinematics(pin_model_, pin_data_, q);
+        pinocchio::updateFramePlacements(pin_model_, pin_data_);
+
+        const auto& oMf = pin_data_.oMf[ee_frame_id_];
+        pos = oMf.translation();
+        rot = oMf.rotation();
+    }
+
 private:
     panda_task_space_nmpc_solver_capsule* capsule_;
     ocp_nlp_config* nlp_config_;
@@ -157,6 +223,44 @@ private:
     // 代价函数残差目标值预分配内存
     double y_ref_[PANDA_TASK_SPACE_NMPC_NY]; 
     double y_ref_e_[PANDA_TASK_SPACE_NMPC_NYN]; 
+
+    pinocchio::Model pin_model_;
+    pinocchio::Data pin_data_{pin_model_};
+    pinocchio::FrameIndex ee_frame_id_;
+
+    void resetWarmStart(const Eigen::Matrix<double, 7, 1>& q,
+                    const Eigen::Matrix<double, 7, 1>& v,
+                    const Eigen::Matrix<double, 7, 1>& a)
+    {
+        Eigen::Matrix<double, 7, 1> qk = q;
+        Eigen::Matrix<double, 7, 1> vk = v;
+        Eigen::Matrix<double, 7, 1> ak = a;
+
+        const double dt = 0.02;   // 必须和生成器一致；如果你改了生成器 dt，这里也要一起改
+
+        for (int k = 0; k <= N_; ++k) {
+            double x_init[PANDA_TASK_SPACE_NMPC_NX] = {0.0};
+
+            for (int i = 0; i < 7; ++i) {
+                x_init[i]      = qk(i);
+                x_init[i + 7]  = vk(i);
+                x_init[i + 14] = ak(i);
+            }
+
+            ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, k, "x", x_init);
+
+            if (k < N_) {
+                // 先把控制初值设成 0 jerk
+                double u_init[PANDA_TASK_SPACE_NMPC_NU] = {0.0};
+                ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, k, "u", u_init);
+
+                // 用 jerk = 0 做一个简单前滚，保证 warm start 至少大体符合动力学
+                qk = qk + dt * vk + 0.5 * dt * dt * ak;
+                vk = vk + dt * ak;
+                // ak 保持不变，因为 jerk = 0
+            }
+        }
+    }
 };
 
 #endif // PANDA_ADVANCED_NMPC_CONTROLLER_HPP_

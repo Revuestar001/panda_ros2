@@ -51,14 +51,14 @@ private:
         // // RCLCPP_INFO(this->get_logger(), "Publish effort message");
         // effort_pub_->publish(msg);
         
-        auto mani_meas = solver_.getYoshikawaManipulabilityMeasure(jq_);
-        RCLCPP_INFO(this->get_logger(), "Yoshikawa Manipulability Measure : %lf, %lf", mani_meas[0], mani_meas[1]);
+        // auto mani_meas = solver_.getYoshikawaManipulabilityMeasure(jq_);
+        // RCLCPP_INFO(this->get_logger(), "Yoshikawa Manipulability Measure : %lf, %lf", mani_meas[0], mani_meas[1]);
 
-        auto min_sin = solver_.getMinSingularValue(jq_);
-        RCLCPP_INFO(this->get_logger(), "Min Singular Value : %lf", min_sin);
+        // auto min_sin = solver_.getMinSingularValue(jq_);
+        // RCLCPP_INFO(this->get_logger(), "Min Singular Value : %lf", min_sin);
 
-        auto condi_num = solver_.getConditionNumber(jq_);
-        RCLCPP_INFO(this->get_logger(), "Condition Number : %lf", condi_num);
+        // auto condi_num = solver_.getConditionNumber(jq_);
+        // RCLCPP_INFO(this->get_logger(), "Condition Number : %lf", condi_num);
         
     }
 
@@ -119,6 +119,12 @@ public:
 
         jq_ = Eigen::VectorXd::Zero(ordered_names_.size());
         jv_ = Eigen::VectorXd::Zero(ordered_names_.size());
+        
+        Eigen::Vector<double, 7> reference_q;
+        reference_q << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        for (size_t i = 0; i < 7; ++i) {
+            nmpc_result_.q_ref.data()[i] = reference_q[i];
+        }
 
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>("/joint_states", 10, [this] (const sensor_msgs::msg::JointState::SharedPtr msg) {this->joint_states_callback(msg);});
         nmpc_result_sub_ = this->create_subscription<panda_interfaces::msg::ResultNMPC>("/nmpc_result", 10, [this] (const panda_interfaces::msg::ResultNMPC::SharedPtr msg) {this->nmpc_result_callback(msg);});

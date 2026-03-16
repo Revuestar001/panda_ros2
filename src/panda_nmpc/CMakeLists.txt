@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(pinocchio REQUIRED)
 
 find_package(panda_interfaces REQUIRED)
 
@@ -77,6 +78,7 @@ target_link_libraries(nmpc_tau
   ${BLASFEO_LIB}
   ${SOLVER_LIB}
   Eigen3::Eigen
+  pinocchio::pinocchio
 )
 
 # [关键技巧] 设置运行时 RPATH，防止 ros2 run 时报 "error while loading shared libraries"
