@@ -12,6 +12,8 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
+find_package(panda_interfaces REQUIRED)
+
 # ==================== [新增] Acados & 求解器配置 ====================
 
 # 确保环境变量 ACADOS_SOURCE_DIR 已设置
@@ -33,6 +35,7 @@ set(ACADOS_INCLUDE_DIRS
 )
 
 include_directories(/home/cyh/panda_ros2/src/panda_nmpc/include/panda_nmpc)
+include_directories(/home/cyh/panda_ros2/install/panda_interfaces/include/panda_interfaces)
 
 # 查找 Acados 核心依赖库
 find_library(ACADOS_LIB acados PATHS ${ACADOS_DIR}/lib REQUIRED)
@@ -64,6 +67,7 @@ ament_target_dependencies(nmpc_tau
   "rclcpp"
   std_msgs
   sensor_msgs
+  panda_interfaces
 )
 
 # 链接 Acados 库和生成的求解器动态库

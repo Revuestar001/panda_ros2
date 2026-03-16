@@ -12,19 +12,28 @@
 #include "acados_c/ocp_nlp_interface.h"
 #include "acados_c/external_function_interface.h"
 
-// 引入自动生成的 Panda 任务空间 NMPC 专属头文件
+// 引入自动生成的 Panda Advanced NMPC 专属头文件 (与 Python 生成的 name 保持一致)
 #include "acados_solver_panda_task_space_nmpc.h"
+
+// 定义 NMPC 的输出结构体，方便 ROS 2 节点调用和对接阻抗控制器
+struct NMPCResult {
+    Eigen::Matrix<double, 7, 1> q_ref;     // 下一步的参考关节角
+    Eigen::Matrix<double, 7, 1> v_ref;     // 下一步的参考关节速度
+    Eigen::Matrix<double, 7, 1> a_ref;     // 下一步的参考关节加速度
+    Eigen::Matrix<double, 7, 1> jerk_cmd;  // 当前计算出的最优加加速度指令
+    int status;                            // 求解器状态码
+};
 
 class PandaNMPCController {
 public:
     PandaNMPCController() {
-        std::cout << "[PandaNMPC] 正在初始化 Acados 求解器..." << std::endl;
+        std::cout << "[Panda Advanced NMPC] 正在初始化 SOTA Acados 求解器..." << std::endl;
 
         // 1. 创建求解器胶囊
         capsule_ = panda_task_space_nmpc_acados_create_capsule();
         int status = panda_task_space_nmpc_acados_create(capsule_);
         if (status) {
-            std::cerr << "[PandaNMPC 错误] 创建求解器失败, 错误码: " << status << std::endl;
+            std::cerr << "[Panda Advanced NMPC 错误] 创建求解器失败, 错误码: " << status << std::endl;
             throw std::runtime_error("Acados solver initialization failed");
         }
 
@@ -34,84 +43,106 @@ public:
         nlp_in_     = panda_task_space_nmpc_acados_get_nlp_in(capsule_);
         nlp_out_    = panda_task_space_nmpc_acados_get_nlp_out(capsule_);
 
-        N_ = nlp_dims_->N; // 预测步数 (通常为 20)
+        N_ = nlp_dims_->N; // 预测视野 (对应 Python 中的 N_horizon = 40)
 
-        // 3. 初始化零空间参考姿态 (Home 位)
-        target_q_rest_ << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        // 初始化预测视野的代价残差全为 0 
+        // (因为我们在 CasADi 内部计算了 pos_error, ori_error, 目标就是让它们趋近于 0)
+        std::memset(y_ref_, 0, sizeof(y_ref_));
+        std::memset(y_ref_e_, 0, sizeof(y_ref_e_));
 
-        std::cout << "[PandaNMPC] 求解器初始化成功!" << std::endl;
+        for (int i = 0; i < N_; i++) {
+            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_);
+        }
+        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e_);
+
+        std::cout << "[Panda Advanced NMPC] 求解器初始化成功! 预测步数 N = " << N_ << std::endl;
     }
 
     ~PandaNMPCController() {
         if (capsule_) {
             panda_task_space_nmpc_acados_free(capsule_);
             panda_task_space_nmpc_acados_free_capsule(capsule_);
-            std::cout << "[PandaNMPC] 求解器内存已释放。" << std::endl;
+            std::cout << "[Panda Advanced NMPC] 求解器内存已安全释放。" << std::endl;
         }
     }
 
     /**
      * @brief 核心求解函数
-     * 注意：注释掉未使用的参数名 (如 target_vel_) 是标准 C++ 消除警告的做法
+     * 
+     * @param target_pos 任务空间目标位置 (3D)
+     * @param target_rot 任务空间目标姿态 (SO(3) 旋转矩阵)
+     * @param obs_pos    动态障碍物当前位置 (3D)
+     * @param current_q  当前关节位置 (7D)
+     * @param current_v  当前关节速度 (7D)
+     * @param current_a  当前关节加速度 (7D) - 若无传感器可传入上一周期的 a_ref
+     * @return NMPCResult 包含下一步的参考状态 (q_ref, v_ref, a_ref) 和求解状态
      */
-    Eigen::VectorXd NMPCSolve(
-        const Eigen::Vector3d& target_pos_,
-        const Eigen::Vector<double, 6>& /*target_vel_*/,
-        const Eigen::Vector<double, 6>& /*target_acc_*/,
-        const Eigen::Matrix3d& /*target_rot_*/,
-        const Eigen::VectorXd& jq_,
-        const Eigen::VectorXd& jv_
+    NMPCResult NMPCSolve(
+        const Eigen::Vector3d& target_pos,
+        const Eigen::Matrix3d& target_rot,
+        const Eigen::VectorXd& reference_q,
+        const Eigen::VectorXd& current_q,
+        const Eigen::VectorXd& current_v,
+        const Eigen::VectorXd& current_a
     ) {
-        // 1. 安全检查
-        if (jq_.size() != 7 || jv_.size() != 7) {
-            std::cerr << "[PandaNMPC 错误] 关节状态维度不匹配！必须为 7。" << std::endl;
-            return Eigen::VectorXd::Zero(7);
+        NMPCResult result;
+        result.status = -1;
+
+        // 1. 严格的安全维度检查 (nx = 21)
+        if (reference_q.size() != 7 || current_q.size() != 7 || current_v.size() != 7 || current_a.size() != 7) {
+            std::cerr << "[Panda NMPC 错误] 关节状态维度不匹配！必须均为 7。" << std::endl;
+            return result;
         }
 
-        // 2. 构建当前状态 current_x = [q, v]
-        double current_x[14];
-        Eigen::Map<Eigen::VectorXd>(current_x, 7) = jq_;
-        Eigen::Map<Eigen::VectorXd>(current_x + 7, 7) = jv_;
+        // 2. 构建当前状态 x0 = [q, v, a]
+        double current_x[PANDA_TASK_SPACE_NMPC_NX] = {0.0};
+        Eigen::Map<Eigen::Matrix<double, 7, 1>>(current_x, 7) = current_q;
+        Eigen::Map<Eigen::Matrix<double, 7, 1>>(current_x + 7, 7)  = current_v;
+        Eigen::Map<Eigen::Matrix<double, 7, 1>>(current_x + 14, 7) = current_a;
 
-        // 设置 NMPC 当前时刻的初始约束 (lbx = ubx = current_x)
+        // 将当前状态作为 NMPC 初始节点的硬约束 (Initial State Constraint)
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "lbx", current_x);
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "ubx", current_x);
 
-        // 3. 构建参考轨迹 y_ref 和 y_ref_e
-        double y_ref[24] = {0.0}; 
-        double y_ref_e[17] = {0.0};
+        // 3. 构建并下发实时参数 (Parameters p)
+        double p_data[PANDA_TASK_SPACE_NMPC_NP] = {0.0};
+        Eigen::Map<Eigen::Vector3d> map_target_pos(p_data);
+        map_target_pos = target_pos;
+        Eigen::Map<Eigen::Matrix3d> map_target_rot(p_data + 3);
+        map_target_rot = target_rot; 
+        Eigen::Map<Eigen::Vector<double, 7>> map_q_nom(p_data + 12);
+        map_q_nom = reference_q;
 
-        // 【终极修复】：显式创建具名的 Map 对象，彻底终结编译器的语法妄想症
-        Eigen::Map<Eigen::Vector3d> map_pos(y_ref);
-        Eigen::Map<Eigen::Vector3d> map_pos_e(y_ref_e);
-        map_pos = target_pos_;
-        map_pos_e = target_pos_;
-
-        Eigen::Map<Eigen::VectorXd> map_q(y_ref + 3, 7);
-        Eigen::Map<Eigen::VectorXd> map_q_e(y_ref_e + 3, 7);
-        map_q = target_q_rest_;
-        map_q_e = target_q_rest_;
-
-        // 将 y_ref 下发到求解器的预测域 (0 to N-1)
-        for (int i = 0; i < N_; i++) {
-            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref);
-        }
-        // 下发终端代价值 (Node N)
-        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
-
-        // 4. 调用求解器
-        int status = panda_task_space_nmpc_acados_solve(capsule_);
-
-        if (status != 0 && status != 4) { 
-            std::cerr << "[PandaNMPC 警告] 求解异常, 状态码: " << status << std::endl;
+        // 将参数更新到所有的预测视野节点 (0 到 N)
+        for (int i = 0; i <= N_; i++) {
+            panda_task_space_nmpc_acados_update_params(capsule_, i, p_data, PANDA_TASK_SPACE_NMPC_NP);
         }
 
-        // 5. 提取最优控制指令 u (关节力矩)
-        double optimal_u[7] = {0.0};
+        // 4. 调用 Acados RTI 求解器进行一步极速优化
+        result.status = panda_task_space_nmpc_acados_solve(capsule_);
+
+        if (result.status != 0 && result.status != 4) { 
+            // 提示: 状态码 4 通常表示达到最大迭代次数，在 RTI 模式下可以接受
+            std::cerr << "[Panda NMPC 警告] 求解异常/次优解, 状态码: " << result.status << std::endl;
+        }
+
+        // 5. 提取最优输出 (Extract SOTA Output)
+        // 【关键逻辑】: 我们要发给阻抗控制器的不是 node 0 的状态(因为那是当前状态)，
+        // 而是 NMPC 预测出的下一步 node 1 的参考状态 (x_1 = [q_ref, v_ref, a_ref])
+        double next_x[PANDA_TASK_SPACE_NMPC_NX] = {0.0};
+        ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 1, "x", next_x);
+
+        // 提取当前周期的最优控制量 (u_0 = jerk)
+        double optimal_u[PANDA_TASK_SPACE_NMPC_NU] = {0.0};
         ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", optimal_u);
 
-        // 返回 Eigen 类型的结果
-        return Eigen::Map<Eigen::VectorXd>(optimal_u, 7);
+        // 6. 装填返回值
+        result.q_ref    = Eigen::Map<Eigen::Matrix<double, 7, 1>>(&next_x[0]);
+        result.v_ref    = Eigen::Map<Eigen::Matrix<double, 7, 1>>(&next_x[7]);
+        result.a_ref    = Eigen::Map<Eigen::Matrix<double, 7, 1>>(&next_x[14]);
+        result.jerk_cmd = Eigen::Map<Eigen::Matrix<double, 7, 1>>(&optimal_u[0]);
+
+        return result;
     }
 
 private:
@@ -122,7 +153,10 @@ private:
     ocp_nlp_out* nlp_out_;
     
     int N_;
-    Eigen::Matrix<double, 7, 1> target_q_rest_; 
+
+    // 代价函数残差目标值预分配内存
+    double y_ref_[PANDA_TASK_SPACE_NMPC_NY]; 
+    double y_ref_e_[PANDA_TASK_SPACE_NMPC_NYN]; 
 };
 
-#endif // PANDA_NMPC_CONTROLLER_HPP_
+#endif // PANDA_ADVANCED_NMPC_CONTROLLER_HPP_

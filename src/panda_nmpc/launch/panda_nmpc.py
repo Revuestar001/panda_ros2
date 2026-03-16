@@ -91,6 +91,15 @@ def launch_setup(context, *args, **kwargs):
             package="panda_nmpc",
             executable="nmpc_tau",
             output="both",
+            # on_exit=Shutdown(),
+        )
+    )
+
+    nodes.append(
+        Node(
+            package="panda_ros",
+            executable="panda_test_node",
+            output="both",
             on_exit=Shutdown(),
         )
     )
