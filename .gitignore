@@ -9,4 +9,3 @@ src/moveit_test
 .vscode
 src/panda_nmpc/nmpc_model_gen/build
 src/panda_nmpc/nmpc_model_gen/c_generated_code
-src/panda_nmpc/nmpc_model_gen/*.json
