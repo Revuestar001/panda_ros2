@@ -9,6 +9,7 @@
 #include <Eigen/Dense>
 
 #include "pinoSolver.hpp"
+#include "panda_interfaces/msg/result_nmpc.hpp"
 
 class panda_test_node : public rclcpp::Node
 {
@@ -24,10 +25,13 @@ private:
     Eigen::VectorXd jq_;
     Eigen::VectorXd jv_;
 
+    panda_interfaces::msg::ResultNMPC nmpc_result_;
+
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr effort_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+    rclcpp::Subscription<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_result_sub_;
 
     std::vector<std::string> ordered_names_ = {
                 "joint1", "joint2", "joint3", "joint4", 
@@ -73,17 +77,23 @@ private:
             }
         }
 
-        Eigen::VectorXd torque = solver_.impedanceControlSolver(target_pos_, target_rot_, target_vel_, target_acc_, jq_, jv_, false);
+        // Eigen::VectorXd torque = solver_.impedanceControlSolver(target_pos_, target_rot_, target_vel_, target_acc_, jq_, jv_, false);
         
-        // Eigen::Vector<double, 7> target_jq;
+        Eigen::Vector<double, 7> target_jq;
+        target_jq = Eigen::Map<Eigen::Vector<double, 7>>(nmpc_result_.q_ref.data());
         // target_jq << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
-        // Eigen::Vector<double, 7> jq = [this] () {return jq_.head<7>();} ();
-        // Eigen::Vector<double, 7> jv = [this] () {return jv_.head<7>();} ();
-        // auto torque = solver_.cSpaceImpedanceControlSolver<7>(target_jq, 
-        //                                                     Eigen::Vector<double, 7>::Zero(),
-        //                                                     Eigen::Vector<double, 7>::Zero(),
-        //                                                     jq,
-        //                                                     jv);
+
+        Eigen::Vector<double, 7> target_jv;
+        target_jv = Eigen::Map<Eigen::Vector<double, 7>>(nmpc_result_.v_ref.data());
+
+        Eigen::Vector<double, 7> target_ja;
+        target_ja = Eigen::Map<Eigen::Vector<double, 7>>(nmpc_result_.a_ref.data());
+
+        auto torque = solver_.cSpaceImpedanceControlSolver<7>(target_jq, 
+                                                            target_jq,
+                                                            target_ja,
+                                                            jq_.head<7>(),
+                                                            jv_.head<7>());
 
         auto effort_msg = std_msgs::msg::Float64MultiArray();
         for (size_t i = 0; i < ordered_names_.size(); ++i) {
@@ -93,6 +103,10 @@ private:
         // RCLCPP_INFO(this->get_logger(), "Publish effort message");
         effort_pub_->publish(effort_msg);
 
+    }
+
+    void nmpc_result_callback(const panda_interfaces::msg::ResultNMPC::SharedPtr msg) {
+        nmpc_result_ = *msg;
     }
 
 public:
@@ -107,6 +121,7 @@ public:
         jv_ = Eigen::VectorXd::Zero(ordered_names_.size());
 
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>("/joint_states", 10, [this] (const sensor_msgs::msg::JointState::SharedPtr msg) {this->joint_states_callback(msg);});
+        nmpc_result_sub_ = this->create_subscription<panda_interfaces::msg::ResultNMPC>("/nmpc_result", 10, [this] (const panda_interfaces::msg::ResultNMPC::SharedPtr msg) {this->nmpc_result_callback(msg);});
         effort_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/effort_controller/commands", 1);
         timer_ = this->create_wall_timer(std::chrono::milliseconds(500), [this] () {this->timer_effort_cmd_callback();});
     }

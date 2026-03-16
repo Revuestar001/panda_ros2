@@ -15,7 +15,10 @@ find_package(pinocchio REQUIRED)
 find_package(mujoco REQUIRED)
 find_package(glfw3 REQUIRED)
 
+find_package(panda_interfaces REQUIRED)
+
 include_directories(/home/cyh/panda_ros2/src/panda_ros/include/panda_ros)
+include_directories(/home/cyh/panda_ros2/install/panda_interfaces/include/panda_interfaces)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -37,6 +40,7 @@ ament_target_dependencies(panda_test_node
   rclcpp
   std_msgs
   sensor_msgs
+  panda_interfaces
 )
 
 target_link_libraries(panda_test_node 

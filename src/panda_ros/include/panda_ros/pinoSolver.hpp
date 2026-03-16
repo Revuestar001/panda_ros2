@@ -78,8 +78,7 @@ public:
     double getConditionNumber(const Eigen::VectorXd& jq_curr);
 
     int getNumJoints() const { return model.nv; }
-
+    Eigen::VectorXd getJointsMeanValue() const { return this->q_mean; }
     pinocchio::Model& getPinocchioModel() { return model; }
-
     pinocchio::Data& getPinocchioData() { return data; }
 };
