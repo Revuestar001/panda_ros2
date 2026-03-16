@@ -111,6 +111,14 @@ public:
             p_data[12 + i] = q_nom(i);
         }
 
+        for (int i = 0; i < 2; ++i) {
+            const int base = 19 + i * 4;
+            p_data[base + 0] = 0.4;  // obs_x
+            p_data[base + 1] = (i == 0) ? -0.1 : 0.1;  // obs_y
+            p_data[base + 2] = 0.35;  // obs_z
+            p_data[base + 3] = 0.1;  // obs_r
+        }
+
         for (int k = 0; k <= N_; ++k) {
             const int st = panda_task_space_nmpc_acados_update_params(
                 capsule_, k, p_data.data(), PANDA_TASK_SPACE_NMPC_NP);

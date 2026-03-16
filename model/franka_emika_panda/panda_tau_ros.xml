@@ -299,8 +299,11 @@
   <!-- <keyframe>
     <key name="home" qpos="0 0 0 -1.57079 0 3.0 -1.7853 0.04 0.04" ctrl="0 0 0 -1.57079 0 1.57079 -0.7853 255"/>
   </keyframe> -->
-  <keyframe>
+  <!-- <keyframe>
     <key name="home" qpos="0.0 -0.785 0.0 -2.356 0.0 1.571 0.785" ctrl="0 0 0 -0.0 0 0 -0.0"/>
+  </keyframe> -->
+  <keyframe>
+    <key name="home" qpos="0.008 -1.382 -0.008 -3.072 -0.007 1.615 0.792" ctrl="0 0 0 -0.0 0 0 -0.0"/>
   </keyframe>
 
   <contact>

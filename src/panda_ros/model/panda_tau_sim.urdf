@@ -71,6 +71,15 @@
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/visual/link3.dae"/>
       </geometry>
     </visual>
+    <visual>
+      <origin xyz="0.03 0.00 -0.06" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.10"/>
+      </geometry>
+      <material name="debug_red">
+        <color rgba="1.0 0.1 0.1 0.45"/>
+      </material>
+    </visual>
     <collision>
       <geometry>
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/collision/link3.stl"/>
@@ -96,6 +105,15 @@
       <geometry>
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/visual/link4.dae"/>
       </geometry>
+    </visual>
+    <visual>
+      <origin xyz="-0.05 0.02 0.02" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.10"/>
+      </geometry>
+      <material name="debug_orange">
+        <color rgba="1.0 0.5 0.0 0.45"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -123,6 +141,33 @@
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/visual/link5.dae"/>
       </geometry>
     </visual>
+    <visual>
+      <origin xyz="0.00 0.08 -0.00" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.060"/>
+      </geometry>
+      <material name="debug_yellow">
+        <color rgba="1.0 0.9 0.1 0.45"/>
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="0.00 0.07 -0.10" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.07"/>
+      </geometry>
+      <material name="debug_green">
+        <color rgba="0.1 1.0 0.1 0.45"/>
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="0.00 0.02 -0.22" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.075"/>
+      </geometry>
+      <material name="debug_green">
+        <color rgba="0.1 1.0 0.1 0.45"/>
+      </material>
+    </visual>
     <collision>
       <geometry>
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/collision/link5.stl"/>
@@ -148,6 +193,24 @@
       <geometry>
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/visual/link6.dae"/>
       </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0.01 0.00 0.00" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.065"/>
+      </geometry>
+      <material name="debug_cyan">
+        <color rgba="0.1 1.0 1.0 0.45"/>
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="0.08 0.02 0.00" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.06"/>
+      </geometry>
+      <material name="debug_cyan">
+        <color rgba="0.1 1.0 1.0 0.45"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -176,6 +239,15 @@
       </geometry>
       <material name="panda_gray"/>
     </visual>
+    <visual>
+      <origin xyz="0.00 0.00 0.065" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.065"/>
+      </geometry>
+      <material name="debug_blue">
+        <color rgba="0.1 0.4 1.0 0.45"/>
+      </material>
+    </visual>
     <collision>
       <geometry>
         <mesh filename="file:///home/cyh/panda_ros2/model/franka_panda_urdf/meshes/collision/link7.stl"/>
@@ -203,6 +275,33 @@
       <mass value="0.76"/>   <!-- 加上两个指头 -->
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.0025" iyz="0.0" izz="0.0017"/>
     </inertial>
+    <visual>
+      <origin xyz="0.00 0.00 0.06" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.060"/>
+      </geometry>
+      <material name="debug_magenta">
+        <color rgba="1.0 0.1 1.0 0.45"/>
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="0.0 0.04 0.06" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.060"/>
+      </geometry>
+      <material name="debug_magenta">
+        <color rgba="1.0 0.1 1.0 0.45"/>
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="0.0 -0.04 0.06" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.060"/>
+      </geometry>
+      <material name="debug_magenta">
+        <color rgba="1.0 0.1 1.0 0.45"/>
+      </material>
+    </visual>
   </link>
   <joint name="joint8" type="fixed">
     <origin rpy="0 0 -0.78539816" xyz="0 0 0.107"/>

@@ -22,6 +22,8 @@ private:
 
     bool joint_state_ready_{false};
 
+    double node_initial_time_;
+
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
@@ -40,10 +42,19 @@ private:
         nmpc_res_pub_->publish(msg);
     }
 
+    void update_target() {
+        double dt = this->now().seconds() - node_initial_time_;
+        target_pos_[0] = -0.27 * std::cos(dt * 2 * M_PI / 5.0) + 0.47;
+        target_pos_[1] = 0.0 * std::cos(dt * 2 * M_PI / 5.0) + 0.0;
+        target_pos_[2] = 0.32;
+    }
+
     void timer_callback() {
         if (!joint_state_ready_) {
             return;
         }
+
+        update_target();
 
         auto res = nmpc_solver_.NMPCSolve(
             target_pos_,
@@ -80,11 +91,14 @@ private:
 
 public:
     NMPCNode() : Node("nmpc_tau_node") {
-        target_pos_ << 0.30, 0.20, 0.40;
+        // target_pos_ << 0.30, 0.20, 0.40;
+        // target_pos_ << 0.15, 0.0, 0.25;
+        target_pos_ << 0.74, 0.0, 0.32;
         target_rot_ = Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix();
 
         reference_q_ = Eigen::VectorXd::Zero(7);
-        reference_q_ << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        // reference_q_ << 0.0, -1.57, 0.785, -2.356, 0.0, 1.571, 0.785;
+        reference_q_ << 0.008, -1.382, -0.008, -3.072, -0.007, 1.615, 0.792;
         jq_ = Eigen::VectorXd::Zero(7);
         jv_ = Eigen::VectorXd::Zero(7);
 
@@ -100,6 +114,8 @@ public:
 
         nmpc_res_pub_ = this->create_publisher<panda_interfaces::msg::ResultNMPC>("/nmpc_result", 1);
         timer_ = this->create_wall_timer(std::chrono::milliseconds(20), [this]() { timer_callback(); });
+
+        node_initial_time_ = this->now().seconds();
     }
 };
 

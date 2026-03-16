@@ -50,6 +50,14 @@ private:
             target_ja,
             jq_.head<7>(),
             jv_.head<7>());
+        // auto torque = solver_.impedanceControlSolver(
+        //     Eigen::Vector3d(0.15, 0.0, 0.25),
+        //     Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix(),
+        //     Eigen::Vector<double, 6>::Zero(),
+        //     Eigen::Vector<double, 6>::Zero(),
+        //     jq_.head<7>(),
+        //     jv_.head<7>(),
+        //     false);
 
         auto effort_msg = std_msgs::msg::Float64MultiArray();
         for (int i = 0; i < 7; ++i) {
@@ -69,7 +77,8 @@ public:
         jv_ = Eigen::VectorXd::Zero(7);
 
         Eigen::Matrix<double, 7, 1> reference_q;
-        reference_q << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        // reference_q << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        reference_q << 0.008, -1.382, -0.008, -3.072, -0.007, 1.615, 0.792;
         for (int i = 0; i < 7; ++i) {
             nmpc_result_.q_ref.data()[i] = reference_q[i];
             nmpc_result_.v_ref.data()[i] = 0.0;
