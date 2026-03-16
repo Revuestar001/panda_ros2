@@ -2,6 +2,7 @@
 #include <chrono>
 #include <vector>
 
+#include <Eigen/Dense>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
@@ -14,6 +15,7 @@ private:
     NMPCResult nmpc_res_last_;
 
     Eigen::Vector3d target_pos_;
+    Eigen::Matrix3d target_rot_;
     Eigen::VectorXd reference_q_;
     Eigen::VectorXd jq_;
     Eigen::VectorXd jv_;
@@ -45,7 +47,8 @@ private:
 
         auto res = nmpc_solver_.NMPCSolve(
             target_pos_,
-            jq_.head<7>(),     // 调试阶段直接使用当前关节角作为 q_nom，先保证稳定
+            target_rot_,
+            jq_.head<7>(),     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
             jq_.head<7>(),
             jv_.head<7>()
         );
@@ -78,8 +81,9 @@ private:
 public:
     NMPCNode() : Node("nmpc_tau_node") {
         target_pos_ << 0.30, 0.20, 0.40;
+        target_rot_ = Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix();
 
-        reference_q_ = Eigen::VectorXd::Zero(ordered_names_.size());
+        reference_q_ = Eigen::VectorXd::Zero(7);
         reference_q_ << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
         jq_ = Eigen::VectorXd::Zero(7);
         jv_ = Eigen::VectorXd::Zero(7);

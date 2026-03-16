@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-离线生成 Panda 任务空间位置跟踪 NMPC 的 acados C 代码。
+离线生成 Panda 任务空间位置+姿态跟踪 NMPC 的 acados C 代码。
 
-这版专门对齐你当前的执行架构：
-- NMPC 不直接输出力矩
-- NMPC 输出下一步 q_ref / v_ref 以及当前步 a_ref
-- 下游仍由关节空间阻抗控制器接收 (q_ref, v_ref, a_ref)
+基于当前已经跑通的“位置跟踪 + a_ref 输出 + 下游关节空间阻抗控制器”版本，
+这一步只增加姿态误差代价，不改变执行层接口。
 
 模型定义
 --------
-状态:  x = [q, v]      in R^14
-控制:  u = a_ref       in R^7
-参数:  p = [p_ref, q_nom] in R^(3+7) = R^10
+状态:  x = [q, v]              in R^14
+控制:  u = a_ref               in R^7
+参数:  p = [p_ref(3), R_ref(9), q_nom(7)] in R^19
 
 连续时间动力学
 ------------
@@ -23,20 +21,22 @@ v_dot = a_ref
 --------
 stage:
     || p_ee(q) - p_ref ||^2_Wp
+  + || e_R(q)          ||^2_WR
   + || q - q_nom       ||^2_Wq
   + || v               ||^2_Wv
   + || a_ref           ||^2_Wa
 
 terminal:
     || p_ee(q) - p_ref ||^2_Wp_e
+  + || e_R(q)          ||^2_WR_e
   + || q - q_nom       ||^2_Wq_e
   + || v               ||^2_Wv_e
 
-说明
-----
-1) 这版显式移除了姿态误差项，先把位置跟踪链路跑通。
-2) 这版也不再使用力矩作为 NMPC 控制输入，避免与下游阻抗控制器语义冲突。
-3) 运行时每个 shooting node 需要设置参数 p = [p_ref(3), q_nom(7)]。
+姿态误差写法
+----------
+这里不用 log3，而用经典几何控制里的 SO(3) 误差向量：
+    e_R = 0.5 * vee(R_ref^T R - R^T R_ref)
+它在小角度附近很平滑，作为“先小步加姿态代价”的版本更稳一些。
 """
 
 from __future__ import annotations
@@ -74,12 +74,16 @@ class PandaLimits:
 
 @dataclass
 class WeightConfig:
+    # 位置继续主导
     pos: np.ndarray = field(default_factory=lambda: np.array([2500.0, 2500.0, 2500.0], dtype=float))
+    # 姿态先给小权重，确认不发散后再逐步加大
+    rot: np.ndarray = field(default_factory=lambda: np.array([100.0, 100.0, 100.0], dtype=float))
     q_reg: np.ndarray = field(default_factory=lambda: np.array([0.5] * 7, dtype=float))
     dq_reg: np.ndarray = field(default_factory=lambda: np.array([0.1] * 7, dtype=float))
     ddq_reg: np.ndarray = field(default_factory=lambda: np.array([0.05] * 7, dtype=float))
 
     pos_e: np.ndarray = field(default_factory=lambda: np.array([4000.0, 4000.0, 4000.0], dtype=float))
+    rot_e: np.ndarray = field(default_factory=lambda: np.array([200.0, 200.0, 200.0], dtype=float))
     q_reg_e: np.ndarray = field(default_factory=lambda: np.array([1.0] * 7, dtype=float))
     dq_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.2] * 7, dtype=float))
 
@@ -112,15 +116,15 @@ class OcpConfig:
 
     @property
     def np_stage(self) -> int:
-        return 10  # p_ref(3) + q_nom(7)
+        return 19  # p_ref(3) + R_ref(9) + q_nom(7)
 
     @property
     def ny(self) -> int:
-        return 24  # pos_err(3) + q_reg(7) + dq_reg(7) + ddq_reg(7)
+        return 27  # pos_err(3) + rot_err(3) + q_reg(7) + dq_reg(7) + ddq_reg(7)
 
     @property
     def ny_e(self) -> int:
-        return 17  # pos_err(3) + q_reg(7) + dq_reg(7)
+        return 20  # pos_err(3) + rot_err(3) + q_reg(7) + dq_reg(7)
 
 
 def assert_fixed_base_7dof(model: pin.Model) -> None:
@@ -135,6 +139,11 @@ def resolve_frame_id(model: pin.Model, ee_frame_name: str) -> int:
         return model.getFrameId(ee_frame_name)
     frame_names = [f.name for f in model.frames]
     raise ValueError(f"URDF 中未找到 frame '{ee_frame_name}'。可用 frame 示例: {frame_names[:20]}")
+
+
+def vee_of_skew(M: ca.SX) -> ca.SX:
+    """将 3x3 反对称矩阵映射到 R^3。"""
+    return ca.vertcat(M[2, 1], M[0, 2], M[1, 0])
 
 
 def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> AcadosOcp:
@@ -157,17 +166,25 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
 
     p = ca.SX.sym("p", cfg.np_stage, 1)
     p_ref = p[0:3]
-    q_nom = p[3:10]
+    R_ref = ca.reshape(p[3:12], 3, 3)  # 列主序恢复
+    q_nom = p[12:19]
 
     f_expl = ca.vertcat(v, a_ref)
     f_impl = xdot - f_expl
 
     cpin.framesForwardKinematics(cmodel, cdata, q)
     p_ee = cdata.oMf[ee_frame_id].translation
+    R_ee = cdata.oMf[ee_frame_id].rotation
+
     pos_err = p_ee - p_ref
+
+    # e_R = 0.5 * vee(R_ref^T R - R^T R_ref)
+    R_err_mat = R_ref.T @ R_ee - R_ee.T @ R_ref
+    rot_err = 0.5 * vee_of_skew(R_err_mat)
 
     cost_y = ca.vertcat(
         pos_err,    # 3
+        rot_err,    # 3
         q - q_nom,  # 7
         v,          # 7
         a_ref,      # 7
@@ -175,6 +192,7 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
 
     cost_y_e = ca.vertcat(
         pos_err,    # 3
+        rot_err,    # 3
         q - q_nom,  # 7
         v,          # 7
     )
@@ -201,8 +219,8 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
     w = cfg.weights
-    ocp.cost.W = np.diag(np.concatenate([w.pos, w.q_reg, w.dq_reg, w.ddq_reg]))
-    ocp.cost.W_e = np.diag(np.concatenate([w.pos_e, w.q_reg_e, w.dq_reg_e]))
+    ocp.cost.W = np.diag(np.concatenate([w.pos, w.rot, w.q_reg, w.dq_reg, w.ddq_reg]))
+    ocp.cost.W_e = np.diag(np.concatenate([w.pos_e, w.rot_e, w.q_reg_e, w.dq_reg_e]))
     ocp.cost.yref = np.zeros(cfg.ny, dtype=float)
     ocp.cost.yref_e = np.zeros(cfg.ny_e, dtype=float)
 
@@ -236,7 +254,7 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="生成 Panda 任务空间位置跟踪 NMPC 的 acados C 代码")
+    parser = argparse.ArgumentParser(description="生成 Panda 任务空间位置+姿态跟踪 NMPC 的 acados C 代码")
     parser.add_argument("--urdf", type=str, required=True, help="Panda URDF 路径")
     parser.add_argument("--ee-frame", type=str, default="ee_center_body", help="末端 frame 名")
     parser.add_argument("--dt", type=float, default=0.02, help="采样时间")
@@ -255,14 +273,13 @@ def main() -> None:
     )
 
     ocp = build_acados_ocp(args.urdf, args.ee_frame, cfg)
-    print("开始生成 Panda 任务空间位置跟踪 NMPC 的 acados C 代码...")
+    print("开始生成 Panda 任务空间位置+姿态跟踪 NMPC 的 acados C 代码...")
     print(f"URDF: {args.urdf}")
     print(f"EE frame: {args.ee_frame}")
-    print(f"dt: {cfg.dt}, N: {cfg.horizon_steps}")
-    print(f"solver_name: {cfg.solver_name}")
+    print(f"solver name: {cfg.solver_name}")
+    print(f"参数维度 np = {cfg.np_stage} = p_ref(3) + R_ref(9) + q_nom(7)")
     AcadosOcpSolver(ocp, json_file=cfg.json_file)
-    print("生成成功。")
-    print("运行时每个 stage 需要设置参数 p = [p_ref(3), q_nom(7)]。")
+    print("生成成功！")
 
 
 if __name__ == "__main__":

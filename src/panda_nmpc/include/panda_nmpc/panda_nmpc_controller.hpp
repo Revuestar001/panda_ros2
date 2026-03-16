@@ -2,7 +2,6 @@
 #define PANDA_NMPC_CONTROLLER_HPP_
 
 #include <array>
-#include <cstring>
 #include <iostream>
 #include <stdexcept>
 
@@ -24,6 +23,7 @@ class PandaNMPCController {
 public:
     using Vec7 = Eigen::Matrix<double, 7, 1>;
     using Vec3 = Eigen::Matrix<double, 3, 1>;
+    using Mat3 = Eigen::Matrix<double, 3, 3>;
 
     PandaNMPCController() {
         std::cout << "[Panda NMPC] 正在初始化 acados solver..." << std::endl;
@@ -71,6 +71,7 @@ public:
 
     NMPCResult NMPCSolve(
         const Vec3& target_pos,
+        const Mat3& target_rot,
         const Vec7& q_nom,
         const Vec7& current_q,
         const Vec7& current_v
@@ -99,15 +100,22 @@ public:
         p_data[0] = target_pos(0);
         p_data[1] = target_pos(1);
         p_data[2] = target_pos(2);
+
+        int idx = 3;
+        for (int col = 0; col < 3; ++col) {
+            for (int row = 0; row < 3; ++row) {
+                p_data[idx++] = target_rot(row, col);
+            }
+        }
         for (int i = 0; i < 7; ++i) {
-            p_data[3 + i] = q_nom(i);
+            p_data[12 + i] = q_nom(i);
         }
 
         for (int k = 0; k <= N_; ++k) {
-            const int status = panda_task_space_nmpc_acados_update_params(
+            const int st = panda_task_space_nmpc_acados_update_params(
                 capsule_, k, p_data.data(), PANDA_TASK_SPACE_NMPC_NP);
-            if (status != 0) {
-                result.status = status;
+            if (st != 0) {
+                result.status = st;
                 return result;
             }
         }
