@@ -30,16 +30,17 @@
 // 规划输出：MoveIt 规划出的关节轨迹
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
-// 全局规划节点：
-// 职责：
-// 1. 接收目标位姿
-// 2. 接收障碍物
-// 3. 调用 MoveIt2 做全局规划
-// 4. 发布规划得到的关节轨迹
+// 新增：用于目标位姿 frame 检查与转换
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
 class GlobalPlanningNode : public rclcpp::Node {
 public:
   explicit GlobalPlanningNode(const rclcpp::NodeOptions& options)
-  : Node("global_planning_node", options) {
+  : Node("global_planning_node", options),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_) {
     // -----------------------------
     // 读取参数
     // -----------------------------
@@ -74,6 +75,10 @@ public:
 
     // 目标姿态容差
     orientation_tolerance_ = declare_parameter<double>("goal_orientation_tolerance", 1.0e-3);
+
+    // 新增：期望的目标位姿参考坐标系。
+    // 如果为空字符串，则在规划时自动使用 MoveIt 的 planning frame。
+    target_frame_ = declare_parameter<std::string>("target_frame", "");
 
     // -----------------------------
     // 创建 publisher
@@ -183,9 +188,9 @@ private:
 
       RCLCPP_INFO(
           get_logger(),
-          "Global planner node ready. planning_group=%s, target_topic=%s, trajectory_topic=%s, collision_object_topic=%s, service=%s",
+          "Global planner node ready. planning_group=%s, target_topic=%s, trajectory_topic=%s, collision_object_topic=%s, service=%s, planning_frame=%s",
           planning_group_.c_str(), target_topic_.c_str(), trajectory_topic_.c_str(), collision_object_topic_.c_str(),
-          plan_service_name_.c_str());
+          plan_service_name_.c_str(), move_group_->getPlanningFrame().c_str());
     } catch (const std::exception& ex) {
       // 初始化失败则清空对象，等待下次 timer 再重试
       planning_scene_interface_.reset();
@@ -242,6 +247,16 @@ private:
 
   // 核心函数：读取最近目标 -> 调 MoveIt 规划 -> 发布轨迹
   bool planAndPublish() {
+    // 新增：如果已有一次规划正在进行，则直接跳过。
+    // 这样在 plan_on_target_update_=true 且目标高频更新时，不会并发/堆积调用 MoveIt。
+    std::unique_lock<std::mutex> planning_lock(planning_mutex_, std::try_to_lock);
+    if (!planning_lock.owns_lock()) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "A planning request is already running. Skip this request.");
+      return false;
+    }
+
     std::optional<geometry_msgs::msg::PoseStamped> target_pose;
 
     {
@@ -264,23 +279,87 @@ private:
       return false;
     }
 
+    // 新增：确定用于规划的目标坐标系。
+    // 若 target_frame_ 为空，则默认使用 MoveIt 的 planning frame。
+    const std::string planning_frame =
+        target_frame_.empty() ? move_group_->getPlanningFrame() : target_frame_;
+
+    // 新增：检查输入目标 pose 是否带 frame_id
+    if (target_pose->header.frame_id.empty()) {
+      RCLCPP_WARN(
+          get_logger(),
+          "Target pose frame_id is empty. Expected a valid frame, preferably '%s'. Planning request ignored.",
+          planning_frame.c_str());
+      return false;
+    }
+
+    geometry_msgs::msg::PoseStamped pose_for_planning = *target_pose;
+
+    // 新增：如果目标位姿不在 planning frame 下，则先转换
+    if (pose_for_planning.header.frame_id != planning_frame) {
+      try {
+        if (!tf_buffer_.canTransform(
+                planning_frame,
+                pose_for_planning.header.frame_id,
+                tf2::TimePointZero,
+                tf2::durationFromSec(0.2))) {
+          RCLCPP_WARN(
+              get_logger(),
+              "Cannot transform target pose from frame '%s' to planning frame '%s'. Planning request ignored.",
+              pose_for_planning.header.frame_id.c_str(),
+              planning_frame.c_str());
+          return false;
+        }
+
+        pose_for_planning = tf_buffer_.transform(
+            pose_for_planning, planning_frame, tf2::durationFromSec(0.2));
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Transformed target pose from frame '%s' to planning frame '%s'.",
+            target_pose->header.frame_id.c_str(),
+            planning_frame.c_str());
+      } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Failed to transform target pose from frame '%s' to planning frame '%s': %s",
+            pose_for_planning.header.frame_id.c_str(),
+            planning_frame.c_str(),
+            ex.what());
+        return false;
+      }
+    }
+
     // 规划起点设为当前机器人状态
     move_group_->setStartStateToCurrentState();
 
     // 规划目标设为末端位姿
-    move_group_->setPoseTarget(*target_pose);
+    move_group_->setPoseTarget(pose_for_planning);
 
     // 调用 MoveIt 规划
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     const bool success = static_cast<bool>(move_group_->plan(plan));
     if (!success) {
-      RCLCPP_WARN(get_logger(), "MoveIt planning failed.");
+      RCLCPP_WARN(
+          get_logger(),
+          "MoveIt planning failed for target frame '%s' (planning frame '%s').",
+          pose_for_planning.header.frame_id.c_str(),
+          planning_frame.c_str());
       move_group_->clearPoseTargets();
       return false;
     }
 
     // 取出规划结果中的 joint trajectory
     trajectory_msgs::msg::JointTrajectory trajectory = plan.trajectory_.joint_trajectory;
+
+    // 新增：检查轨迹点是否为空
+    if (trajectory.points.empty()) {
+      RCLCPP_WARN(
+          get_logger(),
+          "MoveIt returned an empty JointTrajectory. Nothing will be published.");
+      move_group_->clearPoseTargets();
+      return false;
+    }
 
     // 用当前时间给消息打时间戳
     trajectory.header.stamp = now();
@@ -331,6 +410,10 @@ private:
   // 周期性尝试初始化 MoveIt
   rclcpp::TimerBase::SharedPtr init_timer_;
 
+  // 新增：TF buffer 与 listener，用于目标位姿 frame 检查和转换
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
   // -----------------------------
   // 线程同步相关
   // -----------------------------
@@ -347,6 +430,9 @@ private:
   // MoveIt 未 ready 前收到的碰撞物体先缓存在这里
   std::vector<moveit_msgs::msg::CollisionObject> pending_collision_objects_;
 
+  // 保护 MoveIt 规划调用，避免多线程执行器下并发访问 move_group_
+  std::mutex planning_mutex_;
+
   // -----------------------------
   // 参数与配置
   // -----------------------------
@@ -355,6 +441,9 @@ private:
   std::string collision_object_topic_;
   std::string plan_service_name_;
   std::string planning_group_;
+
+  // 目标位姿希望统一到的参考坐标系；为空则使用 MoveIt planning frame
+  std::string target_frame_;
 
   // MoveIt 是否已初始化成功
   bool moveit_ready_{false};
