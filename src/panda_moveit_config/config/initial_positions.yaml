@@ -1,0 +1,11 @@
+# Default initial positions for panda's ros2_control fake system
+
+initial_positions:
+  # 用一组无碰撞的 arm 初始姿态启动 fake ros2_control，避免 MoveIt 以全零位形进入自碰撞。
+  joint1: 0.008
+  joint2: -1.382
+  joint3: -0.008
+  joint4: -3.0718
+  joint5: -0.007
+  joint6: 1.615
+  joint7: 0.792

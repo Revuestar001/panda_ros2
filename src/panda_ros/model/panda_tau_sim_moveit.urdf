@@ -1,5 +1,9 @@
 <?xml version="1.0"?>
 <robot name="panda">
+  <material name="panda_gray">
+    <color rgba="0.7 0.7 0.7 1.0"/>
+  </material>
+
   <link name="link0">
     <visual>
       <geometry>
@@ -319,7 +323,6 @@
     <origin rpy="0 0 -0.78539816" xyz="0 0 0.107"/>
     <parent link="link7"/>
     <child link="hand"/>
-    <axis xyz="0 0 0"/>
   </joint>
   <!-- 添加ee_center_body,和mjcf一致 -->
   <link name="ee_center_body">
@@ -333,7 +336,6 @@
     <origin rpy="0 0 0" xyz="0 0 0.105"/>
     <parent link="hand"/>
     <child link="ee_center_body"/>
-    <axis xyz="0 0 0"/>
   </joint>
   <!-- 补充 hand 上的左右手指 visual / collision，和 Mujoco 模型一致 -->
   <link name="left_finger">
@@ -383,67 +385,5 @@
     <child link="right_finger"/>
   </joint>
 
-  <ros2_control name="MujocoSystem" type="system">
-    <hardware>
-      <plugin>mujoco_ros2_control/MujocoSystemInterface</plugin>
-      <param name="mujoco_model">/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml</param>
-    
-      <param name="sim_speed_factor">1.0</param>
-    
-      <param name="initial_keyframe">home</param>
-    </hardware>
-
-    <joint name="joint1">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-    <joint name="joint2">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-    <joint name="joint3">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-    <joint name="joint4">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-    <joint name="joint5">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-    <joint name="joint6">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-    <joint name="joint7">
-      <command_interface name="effort"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-
-    <!-- <joint name="finger_joint1">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint> -->
-
-    
-  </ros2_control>
 
 </robot>
