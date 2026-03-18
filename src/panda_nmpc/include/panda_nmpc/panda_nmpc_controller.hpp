@@ -4,6 +4,7 @@
 #include <array>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -17,6 +18,14 @@ struct NMPCResult {
     Eigen::Matrix<double, 7, 1> a_ref;
     Eigen::Matrix<double, 7, 1> jerk_cmd;
     int status = -1;
+};
+
+struct NMPCStageReference {
+    Eigen::Matrix<double, 3, 1> target_pos;
+    Eigen::Matrix<double, 3, 3> target_rot;
+    Eigen::Matrix<double, 7, 1> q_nom;
+    Eigen::Matrix<double, 3, 1> ee_lin_vel_ref;
+    Eigen::Matrix<double, 3, 1> ee_ang_vel_ref;
 };
 
 class PandaNMPCController {
@@ -190,7 +199,121 @@ public:
         return result;
     }
 
+    NMPCResult NMPCSolveTrajectory(
+        const std::vector<NMPCStageReference>& stage_refs,
+        const Vec7& current_q,
+        const Vec7& current_v
+    ) {
+        NMPCResult result;
+        result.q_ref = current_q;
+        result.v_ref = Vec7::Zero();
+        result.a_ref = Vec7::Zero();
+        result.jerk_cmd = Vec7::Zero();
+        result.status = -1;
+
+        // [修改] 轨迹接口要求每个 stage 都有一份参考：k = 0..N，共 N+1 个。
+        if (stage_refs.size() != static_cast<std::size_t>(N_ + 1)) {
+            result.status = -100;
+            return result;
+        }
+
+        std::array<double, PANDA_TASK_SPACE_NMPC_NX> x0{};
+        for (int i = 0; i < 7; ++i) {
+            x0[i] = current_q(i);
+            x0[i + 7] = current_v(i);
+        }
+
+        ocp_nlp_constraints_model_set(
+            nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "lbx",
+            const_cast<double*>(x0.data()));
+        ocp_nlp_constraints_model_set(
+            nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "ubx",
+            const_cast<double*>(x0.data()));
+
+        std::array<double, PANDA_TASK_SPACE_NMPC_NP> p_data_per_stage{};
+
+        // [修改] 障碍物参数起始偏移改到 25；未显式使用的障碍物先放到远处，相当于关闭。
+        for (int i = 0; i < kNumRuntimeObstacles; ++i) {
+            const int base = kParamOffsetObstacles + i * kObstacleParamSize;
+            p_data_per_stage[base + 0] = 1000.0;
+            p_data_per_stage[base + 1] = 1000.0;
+            p_data_per_stage[base + 2] = 1000.0;
+            p_data_per_stage[base + 3] = 0.0;
+        }
+        if (kNumRuntimeObstacles > 0) {
+            const int base = kParamOffsetObstacles;
+            p_data_per_stage[base + 0] = 0.4;   // obs_x
+            p_data_per_stage[base + 1] = -0.1;  // obs_y
+            p_data_per_stage[base + 2] = 0.35;  // obs_z
+            p_data_per_stage[base + 3] = 0.1;   // obs_r
+        }
+        if (kNumRuntimeObstacles > 1) {
+            const int base = kParamOffsetObstacles + kObstacleParamSize;
+            p_data_per_stage[base + 0] = 0.4;  // obs_x
+            p_data_per_stage[base + 1] = 0.1;  // obs_y
+            p_data_per_stage[base + 2] = 0.35; // obs_z
+            p_data_per_stage[base + 3] = 0.1;  // obs_r
+        }
+
+        for (int k = 0; k <= N_; ++k) {
+            const auto& stage_ref = stage_refs[k];
+
+            p_data_per_stage[0] = stage_ref.target_pos(0);
+            p_data_per_stage[1] = stage_ref.target_pos(1);
+            p_data_per_stage[2] = stage_ref.target_pos(2);
+
+            int idx = 3;
+            for (int col = 0; col < 3; ++col) {
+                for (int row = 0; row < 3; ++row) {
+                    p_data_per_stage[idx++] = stage_ref.target_rot(row, col);
+                }
+            }
+
+            for (int i = 0; i < 7; ++i) {
+                p_data_per_stage[kParamOffsetQNom + i] = stage_ref.q_nom(i);
+            }
+
+            for (int i = 0; i < 3; ++i) {
+                p_data_per_stage[kParamOffsetEeLinVel + i] = stage_ref.ee_lin_vel_ref(i);
+                p_data_per_stage[kParamOffsetEeAngVel + i] = stage_ref.ee_ang_vel_ref(i);
+            }
+
+            const int st = panda_task_space_nmpc_acados_update_params(
+                capsule_, k, p_data_per_stage.data(), PANDA_TASK_SPACE_NMPC_NP);
+            if (st != 0) {
+                result.status = st;
+                return result;
+            }
+        }
+
+        resetWarmStart(current_q, current_v);
+
+        result.status = panda_task_space_nmpc_acados_solve(capsule_);
+        if (result.status != 0) {
+            has_warm_start_ = false;
+            return result;
+        }
+
+        has_warm_start_ = true;
+
+        std::array<double, PANDA_TASK_SPACE_NMPC_NX> x1{};
+        std::array<double, PANDA_TASK_SPACE_NMPC_NU> u0{};
+        ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 1, "x", x1.data());
+        ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u0.data());
+
+        for (int i = 0; i < 7; ++i) {
+            result.q_ref(i) = x1[i];
+            result.v_ref(i) = x1[i + 7];
+            result.a_ref(i) = u0[i];
+            result.jerk_cmd(i) = 0.0;
+        }
+
+        return result;
+
+    }
+
     double getDt() { return this->dt_; }
+    int getN() { return this->N_; }
 
 private:
     // [修改] 这些偏移与当前 generate.py 的参数布局保持一致。

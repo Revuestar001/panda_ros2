@@ -65,16 +65,16 @@ public:
     plan_on_target_update_ = declare_parameter<bool>("plan_on_target_update", false);
 
     // MoveIt 规划时间上限
-    planning_time_ = declare_parameter<double>("planning_time", 2.0);
+    planning_time_ = declare_parameter<double>("planning_time", 3.0);
 
     // MoveIt 规划尝试次数
-    num_planning_attempts_ = declare_parameter<int>("num_planning_attempts", 3);
+    num_planning_attempts_ = declare_parameter<int>("num_planning_attempts", 5);
 
     // 目标位置容差
-    position_tolerance_ = declare_parameter<double>("goal_position_tolerance", 1.0e-3);
+    position_tolerance_ = declare_parameter<double>("goal_position_tolerance", 5.0e-3);
 
     // 目标姿态容差
-    orientation_tolerance_ = declare_parameter<double>("goal_orientation_tolerance", 1.0e-3);
+    orientation_tolerance_ = declare_parameter<double>("goal_orientation_tolerance", 5.0e-2);
 
     // 新增：期望的目标位姿参考坐标系。
     // 如果为空字符串，则在规划时自动使用 MoveIt 的 planning frame。
@@ -99,7 +99,7 @@ public:
     // 创建 subscriber：碰撞物体
     // -----------------------------
     collision_object_sub_ = create_subscription<moveit_msgs::msg::CollisionObject>(
-        collision_object_topic_, rclcpp::QoS(10),
+        collision_object_topic_, rclcpp::QoS(10).reliable().transient_local(),
         [this](const moveit_msgs::msg::CollisionObject::SharedPtr msg) { onCollisionObject(msg); });
 
     // -----------------------------
@@ -283,6 +283,7 @@ private:
     // 若 target_frame_ 为空，则默认使用 MoveIt 的 planning frame。
     const std::string planning_frame =
         target_frame_.empty() ? move_group_->getPlanningFrame() : target_frame_;
+    RCLCPP_INFO(this->get_logger(), "Planning frame is '%s'.", planning_frame.c_str());
 
     // 新增：检查输入目标 pose 是否带 frame_id
     if (target_pose->header.frame_id.empty()) {
@@ -333,8 +334,20 @@ private:
     // 规划起点设为当前机器人状态
     move_group_->setStartStateToCurrentState();
 
-    // 规划目标设为末端位姿
-    move_group_->setPoseTarget(pose_for_planning);
+    move_group_->clearPoseTargets();
+
+    // 这里只使用 pose target，让 IK / 目标采样发生在 move_group 服务端。
+    // 避免客户端 MoveGroupInterface 本地 current_state_monitor 因 joint_states 时间戳异常而取不到当前状态。
+    const bool target_set = move_group_->setPoseTarget(pose_for_planning);
+
+    if (!target_set) {
+      RCLCPP_WARN(
+          get_logger(),
+          "Failed to set pose target for frame '%s'. Planning request ignored.",
+          pose_for_planning.header.frame_id.c_str());
+      move_group_->clearPoseTargets();
+      return false;
+    }
 
     // 调用 MoveIt 规划
     moveit::planning_interface::MoveGroupInterface::Plan plan;
@@ -361,6 +374,18 @@ private:
       return false;
     }
 
+    // 新增：检查轨迹点时间是否有效（严格递增）
+    for (size_t i = 1; i < trajectory.points.size(); ++i) {
+      if (static_cast<rclcpp::Duration>(trajectory.points[i].time_from_start) <= static_cast<rclcpp::Duration>(trajectory.points[i - 1].time_from_start)) {
+        RCLCPP_WARN(
+            get_logger(),
+            "JointTrajectory has non-increasing time_from_start at point %zu. Nothing will be published.",
+            i);
+        move_group_->clearPoseTargets();
+        return false;
+      }
+    }
+    
     // 用当前时间给消息打时间戳
     trajectory.header.stamp = now();
 
@@ -370,11 +395,13 @@ private:
     // 清掉 pose target，避免影响后续规划
     move_group_->clearPoseTargets();
 
+    const auto total_duration = trajectory.points.back().time_from_start;
     RCLCPP_INFO(
         get_logger(),
-        "Published joint trajectory with %zu points on %s",
+        "Published joint trajectory with %zu points on %s, total duration = %.3f s",
         trajectory.points.size(),
-        trajectory_topic_.c_str());
+        trajectory_topic_.c_str(),
+        rclcpp::Duration(total_duration).seconds());
     return true;
   }
 
@@ -472,8 +499,7 @@ private:
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
 
-  auto node = std::make_shared<GlobalPlanningNode>(
-      rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+  auto node = std::make_shared<GlobalPlanningNode>(rclcpp::NodeOptions());
 
   // 多线程执行器：允许订阅、服务、timer 等回调并发执行
   rclcpp::executors::MultiThreadedExecutor executor;

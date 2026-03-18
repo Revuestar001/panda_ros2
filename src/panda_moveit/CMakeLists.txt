@@ -11,7 +11,10 @@ find_package(geometry_msgs REQUIRED)
 find_package(moveit_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
+find_package(shape_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 
 add_executable(global_planning src/global_planning.cpp)
@@ -26,11 +29,43 @@ ament_target_dependencies(
   "rclcpp"
   "moveit_ros_planning_interface"
   "std_srvs"
+  "tf2_geometry_msgs"
+  "tf2_ros"
   "trajectory_msgs"
 )
 
-install(TARGETS global_planning
+add_executable(goal_commander src/goal_commander.cpp)
+target_include_directories(goal_commander PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(goal_commander PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(
+  goal_commander
+  "geometry_msgs"
+  "rclcpp"
+  "std_srvs"
+)
+
+add_executable(static_obstacles_publisher src/static_obstacles_publisher.cpp)
+target_include_directories(static_obstacles_publisher PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(static_obstacles_publisher PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(
+  static_obstacles_publisher
+  "geometry_msgs"
+  "moveit_msgs"
+  "rclcpp"
+  "shape_msgs"
+)
+
+install(TARGETS global_planning goal_commander static_obstacles_publisher
   DESTINATION lib/${PROJECT_NAME})
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
+  install(DIRECTORY launch
+    DESTINATION share/${PROJECT_NAME})
+endif()
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

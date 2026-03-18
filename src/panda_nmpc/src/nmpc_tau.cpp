@@ -8,10 +8,12 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <pinocchio/algorithm/frames.hpp>
+#include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "panda_interfaces/msg/result_nmpc.hpp"
 #include "panda_nmpc_controller.hpp"
@@ -23,9 +25,18 @@ private:
     using Vec3 = Eigen::Vector3d;
     using Mat3 = Eigen::Matrix3d;
 
+    enum class JointTrajectoryState {
+        kTrajectoryNull = 0,
+        kTrajectoryReady,
+        kTrajectoryUsing,
+        kTrajectoryComplete,
+    };
+
+    // nmpc
     PandaNMPCController nmpc_solver_;
     NMPCResult nmpc_res_last_;
 
+    // sorr
     SecondOrderReferenceRegulator sorr_pos_;
     SecondOrderReferenceRegulator sorr_rot_; 
 
@@ -35,18 +46,35 @@ private:
     Eigen::VectorXd jq_;
     Eigen::VectorXd jv_;
 
+    // global joint trajectory
+    trajectory_msgs::msg::JointTrajectory joint_trajectory_;
+    JointTrajectoryState trajectory_state_{JointTrajectoryState::kTrajectoryNull};
+    double last_joint_trajectory_start_time_{-1.0};
+    std::array<int, 7> trajectory_joint_index_map_{};
+    pinocchio::SE3 joint_trajectory_ee_goal_pose_;
+    Vec7 joint_trajectory_goal_q_{Vec7::Zero()};
+
+    const double ee_frame_pos_tolerance_ = 1e-3;
+    const double ee_frame_rot_tolerance_ = 1e-1;
+    const double ee_frame_lin_vel_tolerance_ = 2e-2;
+    const double ee_frame_ang_vel_tolerance_ = 1e-1;
+
     bool joint_state_ready_{false};
     bool sorr_ready_{false};
+    bool use_global_trajectory_{true};
 
     double node_initial_time_;
 
+    // pinocchio
     pinocchio::Model pin_model_;
     std::unique_ptr<pinocchio::Data> pin_data_;
     pinocchio::FrameIndex ee_frame_id_{0};
 
+    // topic & timer
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+    rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_trajectory_sub_;
 
     std::vector<std::string> ordered_names_ = {
         "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"
@@ -128,39 +156,227 @@ private:
         target_pos_[2] = 0.32;
     }
 
+    double get_joint_trajectory_total_duration() const {
+        if (joint_trajectory_.points.empty()) {
+            return 0.0;
+        }
+        return rclcpp::Duration(joint_trajectory_.points.back().time_from_start).seconds();
+    }
+
+    std::vector<NMPCStageReference> build_terminal_hold_stage_refs() {
+        const int N = nmpc_solver_.getN();
+        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+
+        const Vec3 ee_goal_pos = joint_trajectory_ee_goal_pose_.translation();
+        const Mat3 ee_goal_rot = joint_trajectory_ee_goal_pose_.rotation();
+
+        for (auto& stage_ref : stage_refs) {
+            stage_ref.target_pos = ee_goal_pos;
+            stage_ref.target_rot = ee_goal_rot;
+            stage_ref.q_nom = joint_trajectory_goal_q_;
+            stage_ref.ee_lin_vel_ref.setZero();
+            stage_ref.ee_ang_vel_ref.setZero();
+        }
+
+        return stage_refs;
+    }
+
+    bool is_trajectory_tracking_complete(
+        const double time_duration,
+        const Vec7& current_q,
+        const Vec7& current_v
+    ) {
+        if (joint_trajectory_.points.empty()) {
+            return false;
+        }
+        if (time_duration < get_joint_trajectory_total_duration()) {
+            return false;
+        }
+
+        pinocchio::forwardKinematics(pin_model_, *pin_data_, current_q, current_v);
+        pinocchio::computeJointJacobians(pin_model_, *pin_data_, current_q);
+        pinocchio::updateFramePlacements(pin_model_, *pin_data_);
+
+        Eigen::Matrix<double, 6, Eigen::Dynamic> J_lwa(6, pin_model_.nv);
+        J_lwa.setZero();
+        pinocchio::getFrameJacobian(
+            pin_model_, *pin_data_, ee_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J_lwa);
+
+        const pinocchio::SE3& oMf_current = pin_data_->oMf[ee_frame_id_];
+        const pinocchio::SE3 err_M = oMf_current.actInv(joint_trajectory_ee_goal_pose_);
+        const Eigen::Matrix<double, 6, 1> err = pinocchio::log6(err_M).toVector();
+        const Eigen::Matrix<double, 6, 1> ee_twist = J_lwa.leftCols<7>() * current_v;
+
+        return err.head<3>().norm() < ee_frame_pos_tolerance_ &&
+               err.tail<3>().norm() < ee_frame_rot_tolerance_ &&
+               ee_twist.head<3>().norm() < ee_frame_lin_vel_tolerance_ &&
+               ee_twist.tail<3>().norm() < ee_frame_ang_vel_tolerance_;
+    }
+
+    std::vector<NMPCStageReference> joint_trajectory_resample(const double& time_duration) {
+        const double dt = nmpc_solver_.getDt();
+        const int N = nmpc_solver_.getN();
+
+        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+        if (joint_trajectory_.points.empty()) {
+            Vec3 ee_pos = Vec3::Zero();
+            Mat3 ee_rot = Mat3::Identity();
+            compute_current_ee_pose(ee_pos, ee_rot);
+
+            for (auto& stage_ref : stage_refs) {
+                // 这里不会导致控制发散？
+                stage_ref.target_pos = ee_pos;
+                stage_ref.target_rot = ee_rot;
+                stage_ref.q_nom = jq_.head<7>();
+                stage_ref.ee_lin_vel_ref.setZero();
+                stage_ref.ee_ang_vel_ref.setZero();
+            }
+            return stage_refs;
+        }
+
+        const auto point_time_sec = [](const trajectory_msgs::msg::JointTrajectoryPoint& point) {
+            return rclcpp::Duration(point.time_from_start).seconds();
+        };
+
+        const auto sample_joint_state =
+            [this](const trajectory_msgs::msg::JointTrajectoryPoint& point, Vec7& q, Vec7& dq) {
+                q.setZero();
+                dq.setZero();
+                for (size_t joint = 0; joint < ordered_names_.size(); ++joint) {
+                    const int msg_index = trajectory_joint_index_map_[joint];
+                    q(static_cast<Eigen::Index>(joint)) = point.positions[static_cast<std::size_t>(msg_index)];
+                    if (point.velocities.size() > static_cast<std::size_t>(msg_index)) {
+                        dq(static_cast<Eigen::Index>(joint)) =
+                            point.velocities[static_cast<std::size_t>(msg_index)];
+                    }
+                }
+            };
+
+        const auto& points = joint_trajectory_.points;
+        const double first_time = point_time_sec(points.front());
+        const double last_time = point_time_sec(points.back());
+        std::size_t seg_idx = 0;
+
+        for (int stage = 0; stage <= N; ++stage) {
+            const double query_time = time_duration + stage * dt;
+
+            Vec7 q_stage = Vec7::Zero();
+            Vec7 dq_stage = Vec7::Zero();
+
+            if (query_time <= first_time) {
+                sample_joint_state(points.front(), q_stage, dq_stage);
+            } else if (query_time >= last_time) {
+                sample_joint_state(points.back(), q_stage, dq_stage);
+                dq_stage.setZero();  // 超出轨迹末端后保持末端姿态，速度参考收敛到 0。
+            } else {
+                while (seg_idx + 1 < points.size() && point_time_sec(points[seg_idx + 1]) < query_time) {
+                    ++seg_idx;
+                }
+
+                const auto& point_0 = points[seg_idx];
+                const auto& point_1 = points[seg_idx + 1];
+                const double t0 = point_time_sec(point_0);
+                const double t1 = point_time_sec(point_1);
+                const double alpha = std::clamp((query_time - t0) / (t1 - t0), 0.0, 1.0);
+                const double inv_alpha = 1.0 - alpha;
+
+                for (size_t joint = 0; joint < ordered_names_.size(); ++joint) {
+                    const int msg_index = trajectory_joint_index_map_[joint];
+                    const std::size_t idx = static_cast<std::size_t>(msg_index);
+
+                    const double q0 = point_0.positions[idx];
+                    const double q1 = point_1.positions[idx];
+                    q_stage(static_cast<Eigen::Index>(joint)) = inv_alpha * q0 + alpha * q1;
+
+                    if (point_0.velocities.size() > idx && point_1.velocities.size() > idx) {
+                        const double dq0 = point_0.velocities[idx];
+                        const double dq1 = point_1.velocities[idx];
+                        dq_stage(static_cast<Eigen::Index>(joint)) = inv_alpha * dq0 + alpha * dq1;
+                    } else {
+                        dq_stage(static_cast<Eigen::Index>(joint)) = (q1 - q0) / (t1 - t0);
+                    }
+                }
+            }
+
+            pinocchio::forwardKinematics(pin_model_, *pin_data_, q_stage, dq_stage);
+            pinocchio::computeJointJacobians(pin_model_, *pin_data_, q_stage);
+            pinocchio::updateFramePlacements(pin_model_, *pin_data_);
+
+            Eigen::Matrix<double, 6, Eigen::Dynamic> J_lwa(6, pin_model_.nv);
+            J_lwa.setZero();
+            pinocchio::getFrameJacobian(
+                pin_model_, *pin_data_, ee_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J_lwa);
+
+            const pinocchio::SE3& oMf_ee = pin_data_->oMf[ee_frame_id_];
+            const Eigen::Matrix<double, 6, 1> ee_twist = J_lwa.leftCols<7>() * dq_stage;
+
+            auto& stage_ref = stage_refs[static_cast<std::size_t>(stage)];
+            stage_ref.target_pos = oMf_ee.translation();
+            stage_ref.target_rot = oMf_ee.rotation();
+            stage_ref.q_nom = q_stage;
+            stage_ref.ee_lin_vel_ref = ee_twist.head<3>();
+            stage_ref.ee_ang_vel_ref = ee_twist.tail<3>();
+        }
+
+        return stage_refs;
+    }
+
     void timer_callback() {
         if (!joint_state_ready_ || !sorr_ready_) {
             return;
         }
 
-        update_target();
-
-        const Vec3 filtered_target_pos = sorr_pos_.updatePosition(target_pos_);
-        const Eigen::Quaterniond filtered_target_quat = sorr_rot_.updateOrientation(target_rot_);
-        const Mat3 filtered_target_rot = filtered_target_quat.toRotationMatrix();
-
-        const Vec7 q_nom = jq_.head<7>();
         const Vec7 current_q = jq_.head<7>();
         const Vec7 current_v = jv_.head<7>();
 
-        auto res = nmpc_solver_.NMPCSolve(
-            filtered_target_pos,
-            filtered_target_rot,
-            q_nom,     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
-            sorr_pos_.getLinearVelocity(),
-            sorr_rot_.getAngularVelocity(),
-            current_q,
-            current_v
-        );
-        // auto res = nmpc_solver_.NMPCSolve(
-        //     target_pos_,
-        //     target_rot_,
-        //     q_nom,     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
-        //     sorr_pos_.getLinearVelocity(),
-        //     sorr_rot_.getAngularVelocity(),
-        //     current_q,
-        //     current_v
-        // );
+        auto res = nmpc_res_last_;
+
+        if (!use_global_trajectory_) {
+            update_target();
+
+            const Vec7 q_nom = jq_.head<7>();
+
+            const Vec3 filtered_target_pos = sorr_pos_.updatePosition(target_pos_);
+            const Eigen::Quaterniond filtered_target_quat = sorr_rot_.updateOrientation(target_rot_);
+            const Mat3 filtered_target_rot = filtered_target_quat.toRotationMatrix();
+
+            res = nmpc_solver_.NMPCSolve(
+                filtered_target_pos,
+                filtered_target_rot,
+                q_nom,     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
+                sorr_pos_.getLinearVelocity(),
+                sorr_rot_.getAngularVelocity(),
+                current_q,
+                current_v
+            );
+        } else {
+            // 使用全局关节参考轨迹
+            switch (trajectory_state_) {
+                case JointTrajectoryState::kTrajectoryNull :
+                    RCLCPP_WARN_THROTTLE(
+                        this->get_logger(), *this->get_clock(), 1000,
+                        "Joints trajectory is null, hold on.");
+                    break;
+                case JointTrajectoryState::kTrajectoryReady :
+                    last_joint_trajectory_start_time_ = this->now().seconds();
+                    trajectory_state_ = JointTrajectoryState::kTrajectoryUsing;
+                    [[fallthrough]];
+                case JointTrajectoryState::kTrajectoryUsing :
+                {
+                    const double time_duration = this->now().seconds() - last_joint_trajectory_start_time_;
+                    res = nmpc_solver_.NMPCSolveTrajectory(joint_trajectory_resample(time_duration), current_q, current_v);
+                    if (is_trajectory_tracking_complete(time_duration, current_q, current_v)) {
+                        trajectory_state_ = JointTrajectoryState::kTrajectoryComplete;
+                        RCLCPP_INFO(this->get_logger(), "Global joint trajectory completed, switching to terminal hold.");
+                    }
+                    break;
+                }
+                case JointTrajectoryState::kTrajectoryComplete :
+                    res = nmpc_solver_.NMPCSolveTrajectory(
+                        build_terminal_hold_stage_refs(), current_q, current_v);
+                    break;
+            }
+        }
 
         if (res.status == 0) {
             nmpc_res_last_ = res;
@@ -191,6 +407,66 @@ private:
         }
     }
 
+    void joint_trajectory_callback(const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) {
+        if (msg->points.size() < 2) {
+            RCLCPP_WARN(this->get_logger(), "Invalid joints trajectory, size less than 2.");
+            return;
+        }
+
+        trajectory_joint_index_map_.fill(-1);
+        for (size_t i = 0; i < ordered_names_.size(); ++i) {
+            auto it = std::find(msg->joint_names.begin(), msg->joint_names.end(), ordered_names_[i]);
+            if (it == msg->joint_names.end()) {
+                RCLCPP_ERROR(this->get_logger(), "Joint %s not found in joint_trajectory", ordered_names_[i].c_str());
+                return;
+            }
+            const int index = static_cast<int>(std::distance(msg->joint_names.begin(), it));
+            trajectory_joint_index_map_[i] = index;
+        }
+
+        // [修改] 轨迹采样依赖 time_from_start 做插值，必须保证严格递增。
+        for (size_t i = 0; i < msg->points.size(); ++i) {
+            const auto& point = msg->points[i];
+            if (point.positions.size() < ordered_names_.size()) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Joint trajectory point %zu has only %zu positions, expected at least %zu.",
+                    i, point.positions.size(), ordered_names_.size());
+                return;
+            }
+            if (i > 0 &&
+                rclcpp::Duration(point.time_from_start) <=
+                    rclcpp::Duration(msg->points[i - 1].time_from_start)) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Joint trajectory time_from_start is not strictly increasing at point %zu.",
+                    i);
+                return;
+            }
+        }
+        
+        joint_trajectory_ = *msg;
+
+        const auto& last_point = joint_trajectory_.points.back();
+        for (size_t i = 0; i < ordered_names_.size(); ++i) {
+            const int joint_msg_index = trajectory_joint_index_map_[i];
+            joint_trajectory_goal_q_(static_cast<Eigen::Index>(i)) = last_point.positions[joint_msg_index];
+        }
+        pinocchio::forwardKinematics(pin_model_, *pin_data_, joint_trajectory_goal_q_);
+        pinocchio::updateFramePlacements(pin_model_, *pin_data_);
+        joint_trajectory_ee_goal_pose_ = pin_data_->oMf[ee_frame_id_];
+
+        // [修改] 收到新轨迹后总是重置为 ready，并切到全局轨迹模式。
+        last_joint_trajectory_start_time_ = -1.0;
+        use_global_trajectory_ = true;
+        trajectory_state_ = JointTrajectoryState::kTrajectoryReady;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Received global joint trajectory with %zu points. Switched to global trajectory mode.",
+            joint_trajectory_.points.size());
+    }
+
 public:
     NMPCNode() : Node("nmpc_tau_node") {
         initialize_pinocchio();
@@ -218,6 +494,10 @@ public:
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) { joint_states_callback(msg); });
+        
+        joint_trajectory_sub_ = this->create_subscription<trajectory_msgs::msg::JointTrajectory> (
+            "/global_joint_trajectory", 10, 
+            [this](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) { joint_trajectory_callback(msg); });
 
         nmpc_res_pub_ = this->create_publisher<panda_interfaces::msg::ResultNMPC>("/nmpc_result", 1);
         timer_ = this->create_wall_timer(std::chrono::milliseconds(static_cast<int64_t>(nmpc_solver_.getDt() * 1000)), [this]() { timer_callback(); });

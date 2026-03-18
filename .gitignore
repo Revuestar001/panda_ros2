@@ -10,3 +10,4 @@ src/moveit_test
 src/panda_nmpc/nmpc_model_gen/build
 src/panda_nmpc/nmpc_model_gen/c_generated_code
 src/panda_nmpc/nmpc_model_gen/*.json
+*.pyc
