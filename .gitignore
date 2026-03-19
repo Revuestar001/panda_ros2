@@ -3,9 +3,9 @@ install
 log
 src/mujoco_ros2_control
 src/moveit_test
-*.obj
-*.stl
-*.dae
+# *.obj
+# *.stl
+# *.dae
 .vscode
 src/panda_nmpc/nmpc_model_gen/build
 src/panda_nmpc/nmpc_model_gen/c_generated_code
