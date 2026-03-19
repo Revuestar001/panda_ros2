@@ -7,6 +7,7 @@ endif()
 
 # 1. 查找 ROS 2 依赖
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -66,6 +67,7 @@ target_compile_features(nmpc_tau PUBLIC c_std_99 cxx_std_17)
 
 # 3. 链接目标与库
 ament_target_dependencies(nmpc_tau 
+  "ament_index_cpp"
   "rclcpp"
   std_msgs
   sensor_msgs

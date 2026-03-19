@@ -1,12 +1,15 @@
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
@@ -46,6 +49,12 @@ private:
     Eigen::VectorXd jq_;
     Eigen::VectorXd jv_;
 
+    std::string urdf_path_;
+    std::string ee_frame_name_;
+    std::string joint_states_topic_;
+    std::string joint_trajectory_topic_;
+    std::string nmpc_result_topic_;
+
     // global joint trajectory
     trajectory_msgs::msg::JointTrajectory joint_trajectory_;
     JointTrajectoryState trajectory_state_{JointTrajectoryState::kTrajectoryNull};
@@ -54,14 +63,24 @@ private:
     pinocchio::SE3 joint_trajectory_ee_goal_pose_;
     Vec7 joint_trajectory_goal_q_{Vec7::Zero()};
 
-    const double ee_frame_pos_tolerance_ = 1e-3;
-    const double ee_frame_rot_tolerance_ = 1e-1;
-    const double ee_frame_lin_vel_tolerance_ = 2e-2;
-    const double ee_frame_ang_vel_tolerance_ = 1e-1;
+    double ee_frame_pos_tolerance_{1e-3};
+    double ee_frame_rot_tolerance_{1e-1};
+    double ee_frame_lin_vel_tolerance_{2e-2};
+    double ee_frame_ang_vel_tolerance_{1e-1};
+
+    double sorr_pos_damping_ratio_{1.0};
+    double sorr_pos_natural_frequency_{10.0};
+    double sorr_pos_max_linear_velocity_{1.0};
+    double sorr_pos_max_linear_acceleration_{10.0};
+
+    double sorr_rot_damping_ratio_{1.0};
+    double sorr_rot_natural_frequency_{10.0};
+    double sorr_rot_max_angular_velocity_{0.7845};
+    double sorr_rot_max_angular_acceleration_{0.7845};
 
     bool joint_state_ready_{false};
     bool sorr_ready_{false};
-    bool use_global_trajectory_{true};
+    bool use_global_trajectory_{false};
 
     double node_initial_time_;
 
@@ -80,34 +99,81 @@ private:
         "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"
     };
 
-    void initialize_pinocchio() {
-        const std::string panda_ros_share = "/home/cyh/panda_ros2/src/panda_ros";
-        const std::string urdf_path = panda_ros_share + "/model/panda_tau_sim.urdf";
+    static std::string default_panda_urdf_path() {
+        try {
+            return ament_index_cpp::get_package_share_directory("panda_ros") + "/model/panda_tau_sim.urdf";
+        } catch (const std::exception&) {
+            return "/home/cyh/panda_ros2/src/panda_ros/model/panda_tau_sim.urdf";
+        }
+    }
 
-        pinocchio::urdf::buildModel(urdf_path, pin_model_);
+    void declare_startup_parameters() {
+        urdf_path_ = this->declare_parameter<std::string>("urdf_path", default_panda_urdf_path());
+        ee_frame_name_ = this->declare_parameter<std::string>("ee_frame_name", "ee_center_body");
+
+        joint_states_topic_ = this->declare_parameter<std::string>("joint_states_topic", "/joint_states");
+        joint_trajectory_topic_ =
+            this->declare_parameter<std::string>("joint_trajectory_topic", "/global_joint_trajectory");
+        nmpc_result_topic_ = this->declare_parameter<std::string>("nmpc_result_topic", "/nmpc_result");
+
+        target_pos_.x() = this->declare_parameter<double>("target_x", 0.25);
+        target_pos_.y() = this->declare_parameter<double>("target_y", 0.3);
+        target_pos_.z() = this->declare_parameter<double>("target_z", 0.25);
+
+        const double target_qx = this->declare_parameter<double>("target_qx", 1.0);
+        const double target_qy = this->declare_parameter<double>("target_qy", 0.0);
+        const double target_qz = this->declare_parameter<double>("target_qz", 0.0);
+        const double target_qw = this->declare_parameter<double>("target_qw", 0.0);
+        const Eigen::Quaterniond target_quat(target_qw, target_qx, target_qy, target_qz);
+        target_rot_ = target_quat.normalized().toRotationMatrix();
+
+        use_global_trajectory_ = this->declare_parameter<bool>("use_global_trajectory", false);
+
+        ee_frame_pos_tolerance_ = this->declare_parameter<double>("ee_frame_pos_tolerance", 1.0e-3);
+        ee_frame_rot_tolerance_ = this->declare_parameter<double>("ee_frame_rot_tolerance", 1.0e-1);
+        ee_frame_lin_vel_tolerance_ = this->declare_parameter<double>("ee_frame_lin_vel_tolerance", 2.0e-2);
+        ee_frame_ang_vel_tolerance_ = this->declare_parameter<double>("ee_frame_ang_vel_tolerance", 1.0e-1);
+
+        sorr_pos_damping_ratio_ = this->declare_parameter<double>("sorr_pos_damping_ratio", 1.0);
+        sorr_pos_natural_frequency_ = this->declare_parameter<double>("sorr_pos_natural_frequency", 10.0);
+        sorr_pos_max_linear_velocity_ =
+            this->declare_parameter<double>("sorr_pos_max_linear_velocity", 1.0);
+        sorr_pos_max_linear_acceleration_ =
+            this->declare_parameter<double>("sorr_pos_max_linear_acceleration", 10.0);
+
+        sorr_rot_damping_ratio_ = this->declare_parameter<double>("sorr_rot_damping_ratio", 1.0);
+        sorr_rot_natural_frequency_ = this->declare_parameter<double>("sorr_rot_natural_frequency", 10.0);
+        sorr_rot_max_angular_velocity_ =
+            this->declare_parameter<double>("sorr_rot_max_angular_velocity", 0.7845);
+        sorr_rot_max_angular_acceleration_ =
+            this->declare_parameter<double>("sorr_rot_max_angular_acceleration", 0.7845);
+    }
+
+    void initialize_pinocchio() {
+        pinocchio::urdf::buildModel(urdf_path_, pin_model_);
         pin_data_ = std::make_unique<pinocchio::Data>(pin_model_);
 
-        if (!pin_model_.existFrame("ee_center_body")) {
-            throw std::runtime_error("ee_center_body frame not found in Panda URDF.");
+        if (!pin_model_.existFrame(ee_frame_name_)) {
+            throw std::runtime_error(ee_frame_name_ + " frame not found in Panda URDF.");
         }
-        ee_frame_id_ = pin_model_.getFrameId("ee_center_body");
+        ee_frame_id_ = pin_model_.getFrameId(ee_frame_name_);
     }
 
     void set_sorr_config() {
         SecondOrderReferenceRegulator::Config sorr_pos_config;
         sorr_pos_config.dt = nmpc_solver_.getDt();
-        sorr_pos_config.damping_ratio = 1.0;
-        sorr_pos_config.natural_frequency = 10.0;
-        sorr_pos_config.max_linear_velocity = 1.0;
-        sorr_pos_config.max_linear_acceleration = 10.0;
+        sorr_pos_config.damping_ratio = sorr_pos_damping_ratio_;
+        sorr_pos_config.natural_frequency = sorr_pos_natural_frequency_;
+        sorr_pos_config.max_linear_velocity = sorr_pos_max_linear_velocity_;
+        sorr_pos_config.max_linear_acceleration = sorr_pos_max_linear_acceleration_;
         sorr_pos_.setConfig(sorr_pos_config);
 
         SecondOrderReferenceRegulator::Config sorr_rot_config;
         sorr_rot_config.dt = nmpc_solver_.getDt();
-        sorr_rot_config.damping_ratio = 1.0;
-        sorr_rot_config.natural_frequency = 10.0;
-        sorr_rot_config.max_angular_velocity = 0.7845;
-        sorr_rot_config.max_angular_acceleration = 0.7845;
+        sorr_rot_config.damping_ratio = sorr_rot_damping_ratio_;
+        sorr_rot_config.natural_frequency = sorr_rot_natural_frequency_;
+        sorr_rot_config.max_angular_velocity = sorr_rot_max_angular_velocity_;
+        sorr_rot_config.max_angular_acceleration = sorr_rot_max_angular_acceleration_;
         sorr_rot_.setConfig(sorr_rot_config);
     }
 
@@ -332,7 +398,7 @@ private:
         auto res = nmpc_res_last_;
 
         if (!use_global_trajectory_) {
-            update_target();
+            // update_target();
 
             const Vec7 q_nom = jq_.head<7>();
 
@@ -469,12 +535,8 @@ private:
 
 public:
     NMPCNode() : Node("nmpc_tau_node") {
+        declare_startup_parameters();
         initialize_pinocchio();
-
-        // target_pos_ << 0.30, 0.20, 0.40;
-        // target_pos_ << 0.15, 0.0, 0.25;
-        target_pos_ << 0.74, 0.0, 0.32;
-        target_rot_ = Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix();
 
         reference_q_ = Eigen::VectorXd::Zero(7);
         // reference_q_ << 0.0, -1.57, 0.785, -2.356, 0.0, 1.571, 0.785;
@@ -492,17 +554,27 @@ public:
         set_sorr_config();
 
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
-            "/joint_states", 10,
+            joint_states_topic_, 10,
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) { joint_states_callback(msg); });
         
         joint_trajectory_sub_ = this->create_subscription<trajectory_msgs::msg::JointTrajectory> (
-            "/global_joint_trajectory", 10, 
+            joint_trajectory_topic_, 10, 
             [this](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) { joint_trajectory_callback(msg); });
 
-        nmpc_res_pub_ = this->create_publisher<panda_interfaces::msg::ResultNMPC>("/nmpc_result", 1);
+        nmpc_res_pub_ = this->create_publisher<panda_interfaces::msg::ResultNMPC>(nmpc_result_topic_, 1);
         timer_ = this->create_wall_timer(std::chrono::milliseconds(static_cast<int64_t>(nmpc_solver_.getDt() * 1000)), [this]() { timer_callback(); });
 
         node_initial_time_ = this->now().seconds();
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "NMPC node configured. use_global_trajectory=%s, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, result_topic=%s",
+            use_global_trajectory_ ? "true" : "false",
+            urdf_path_.c_str(),
+            ee_frame_name_.c_str(),
+            joint_states_topic_.c_str(),
+            joint_trajectory_topic_.c_str(),
+            nmpc_result_topic_.c_str());
     }
 };
 
