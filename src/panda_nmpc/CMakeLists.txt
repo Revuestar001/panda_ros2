@@ -8,6 +8,7 @@ endif()
 # 1. 查找 ROS 2 依赖
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -56,6 +57,10 @@ add_executable(nmpc_tau
   src/nmpc_tau.cpp
 )
 
+add_executable(nmpc_tau_original
+  src/nmpc_tau_original.cpp
+)
+
 # 包含所有的头文件路径
 target_include_directories(nmpc_tau PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -63,11 +68,29 @@ target_include_directories(nmpc_tau PUBLIC
   ${ACADOS_INCLUDE_DIRS}
 )
 
+target_include_directories(nmpc_tau_original PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${ACADOS_INCLUDE_DIRS}
+)
+
 target_compile_features(nmpc_tau PUBLIC c_std_99 cxx_std_17) 
+target_compile_features(nmpc_tau_original PUBLIC c_std_99 cxx_std_17)
 
 # 3. 链接目标与库
 ament_target_dependencies(nmpc_tau 
   "ament_index_cpp"
+  "geometry_msgs"
+  "rclcpp"
+  std_msgs
+  sensor_msgs
+  panda_interfaces
+  "trajectory_msgs"
+)
+
+ament_target_dependencies(nmpc_tau_original
+  "ament_index_cpp"
+  "geometry_msgs"
   "rclcpp"
   std_msgs
   sensor_msgs
@@ -85,15 +108,29 @@ target_link_libraries(nmpc_tau
   pinocchio::pinocchio
 )
 
+target_link_libraries(nmpc_tau_original
+  ${ACADOS_LIB}
+  ${HPIPM_LIB}
+  ${BLASFEO_LIB}
+  ${SOLVER_LIB}
+  Eigen3::Eigen
+  pinocchio::pinocchio
+)
+
 # [关键技巧] 设置运行时 RPATH，防止 ros2 run 时报 "error while loading shared libraries"
 set_target_properties(nmpc_tau PROPERTIES 
   BUILD_WITH_INSTALL_RPATH TRUE
   INSTALL_RPATH "${ACADOS_DIR}/lib;${CMAKE_INSTALL_PREFIX}/lib/${PROJECT_NAME}/c_generated_code"
 )
 
+set_target_properties(nmpc_tau_original PROPERTIES
+  BUILD_WITH_INSTALL_RPATH TRUE
+  INSTALL_RPATH "${ACADOS_DIR}/lib;${CMAKE_INSTALL_PREFIX}/lib/${PROJECT_NAME}/c_generated_code"
+)
+
 # 4. 安装规则
 # 安装可执行文件
-install(TARGETS nmpc_tau
+install(TARGETS nmpc_tau nmpc_tau_original
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY

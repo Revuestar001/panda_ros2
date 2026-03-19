@@ -15,6 +15,7 @@
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
@@ -27,6 +28,12 @@ private:
     using Vec7 = Eigen::Matrix<double, 7, 1>;
     using Vec3 = Eigen::Vector3d;
     using Mat3 = Eigen::Matrix3d;
+
+    struct TaskSpacePathSample {
+        double path_s{0.0};
+        Vec3 pos{Vec3::Zero()};
+        Vec7 q{Vec7::Zero()};
+    };
 
     enum class JointTrajectoryState {
         kTrajectoryNull = 0,
@@ -41,7 +48,7 @@ private:
 
     // sorr
     SecondOrderReferenceRegulator sorr_pos_;
-    SecondOrderReferenceRegulator sorr_rot_; 
+    SecondOrderReferenceRegulator sorr_rot_;
 
     Eigen::Vector3d target_pos_;
     Eigen::Matrix3d target_rot_;
@@ -54,14 +61,18 @@ private:
     std::string joint_states_topic_;
     std::string joint_trajectory_topic_;
     std::string nmpc_result_topic_;
+    std::string target_pose_topic_;
 
     // global joint trajectory
     trajectory_msgs::msg::JointTrajectory joint_trajectory_;
     JointTrajectoryState trajectory_state_{JointTrajectoryState::kTrajectoryNull};
     double last_joint_trajectory_start_time_{-1.0};
     std::array<int, 7> trajectory_joint_index_map_{};
-    pinocchio::SE3 joint_trajectory_ee_goal_pose_;
-    Vec7 joint_trajectory_goal_q_{Vec7::Zero()};
+
+    // [修改] 预先把 MoveIt 关节轨迹转成任务空间路径样本；NMPC 后续按“路径进度”而不是“绝对时间”取参考。
+    std::vector<TaskSpacePathSample> task_space_path_samples_;
+    std::size_t task_space_path_progress_index_{0};
+    double trajectory_path_stage_spacing_{0.015};
 
     double ee_frame_pos_tolerance_{1e-3};
     double ee_frame_rot_tolerance_{1e-1};
@@ -94,6 +105,7 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_trajectory_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_sub_;
 
     std::vector<std::string> ordered_names_ = {
         "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"
@@ -115,6 +127,7 @@ private:
         joint_trajectory_topic_ =
             this->declare_parameter<std::string>("joint_trajectory_topic", "/global_joint_trajectory");
         nmpc_result_topic_ = this->declare_parameter<std::string>("nmpc_result_topic", "/nmpc_result");
+        target_pose_topic_ = this->declare_parameter<std::string>("target_pose_topic", "/global_target_pose");
 
         target_pos_.x() = this->declare_parameter<double>("target_x", 0.25);
         target_pos_.y() = this->declare_parameter<double>("target_y", 0.3);
@@ -147,6 +160,10 @@ private:
             this->declare_parameter<double>("sorr_rot_max_angular_velocity", 0.7845);
         sorr_rot_max_angular_acceleration_ =
             this->declare_parameter<double>("sorr_rot_max_angular_acceleration", 0.7845);
+
+        // [修改] 用路径弧长而不是 time_from_start 推 horizon 参考。
+        trajectory_path_stage_spacing_ =
+            this->declare_parameter<double>("trajectory_path_stage_spacing", 0.015);
     }
 
     void initialize_pinocchio() {
@@ -205,6 +222,32 @@ private:
         RCLCPP_INFO(this->get_logger(), "SORR initialized from current EE pose.");
     }
 
+    // [修改] 统一管理“真正想达到的末端目标 pose”：
+    // 始终使用当前存储的 target_pos_/target_rot_，不再退回到 MoveIt 轨迹末端 FK。
+    void get_desired_goal_pose(Vec3& goal_pos, Mat3& goal_rot) const {
+        goal_pos = target_pos_;
+        goal_rot = target_rot_;
+    }
+
+    // [修改] 在全局路径模式下，中间 stage 的姿态参考不再直接跟随 MoveIt 的 sample.rot，
+    // 而是沿“当前姿态 -> 最终目标姿态”做渐进插值，从而只借用 MoveIt 的位置路径，不借用其整段姿态时间表。
+    Mat3 build_progress_based_orientation_reference(
+        const Mat3& current_ee_rot,
+        double query_s) const {
+        Vec3 goal_pos = Vec3::Zero();
+        Mat3 goal_rot = Mat3::Identity();
+        get_desired_goal_pose(goal_pos, goal_rot);
+
+        const double total_s =
+            task_space_path_samples_.empty() ? 0.0 : task_space_path_samples_.back().path_s;
+        const double alpha =
+            (total_s > 1.0e-9) ? std::clamp(query_s / total_s, 0.0, 1.0) : 1.0;
+
+        const Eigen::Quaterniond q_curr(current_ee_rot);
+        const Eigen::Quaterniond q_goal(goal_rot);
+        return q_curr.slerp(alpha, q_goal).normalized().toRotationMatrix();
+    }
+
     void publish_result(const NMPCResult& res) {
         auto msg = panda_interfaces::msg::ResultNMPC();
         Eigen::Map<Eigen::Matrix<double, 7, 1>>(msg.q_ref.data()) = res.q_ref;
@@ -222,24 +265,131 @@ private:
         target_pos_[2] = 0.32;
     }
 
-    double get_joint_trajectory_total_duration() const {
-        if (joint_trajectory_.points.empty()) {
-            return 0.0;
+    // [修改] 统一的关节采样函数，供轨迹接收时预计算任务空间路径使用。
+    void sample_joint_state_from_trajectory_point(
+        const trajectory_msgs::msg::JointTrajectoryPoint& point,
+        Vec7& q,
+        Vec7& dq) const {
+        q.setZero();
+        dq.setZero();
+        for (size_t joint = 0; joint < ordered_names_.size(); ++joint) {
+            const int msg_index = trajectory_joint_index_map_[joint];
+            const std::size_t idx = static_cast<std::size_t>(msg_index);
+            q(static_cast<Eigen::Index>(joint)) = point.positions[idx];
+            if (point.velocities.size() > idx) {
+                dq(static_cast<Eigen::Index>(joint)) = point.velocities[idx];
+            }
         }
-        return rclcpp::Duration(joint_trajectory_.points.back().time_from_start).seconds();
     }
 
-    std::vector<NMPCStageReference> build_terminal_hold_stage_refs() {
+    // [修改] 路径进度只使用位置距离，彻底去掉 MoveIt 中间姿态对路径跟踪的影响。
+    double task_space_metric(const Vec3& pos_a, const Vec3& pos_b) const {
+        return (pos_a - pos_b).norm();
+    }
+
+    // [修改] 收到 MoveIt 轨迹后，只预计算一遍 task-space path samples。
+    void build_task_space_path_samples_from_joint_trajectory() {
+        task_space_path_samples_.clear();
+        task_space_path_progress_index_ = 0;
+
+        if (joint_trajectory_.points.empty()) {
+            return;
+        }
+
+        task_space_path_samples_.reserve(joint_trajectory_.points.size());
+
+        double cumulative_s = 0.0;
+        Vec3 prev_pos = Vec3::Zero();
+        bool has_prev = false;
+
+        for (const auto& point : joint_trajectory_.points) {
+            Vec7 q_stage = Vec7::Zero();
+            Vec7 dq_stage = Vec7::Zero();
+            sample_joint_state_from_trajectory_point(point, q_stage, dq_stage);
+
+            pinocchio::forwardKinematics(pin_model_, *pin_data_, q_stage);
+            pinocchio::updateFramePlacements(pin_model_, *pin_data_);
+            const pinocchio::SE3& oMf_ee = pin_data_->oMf[ee_frame_id_];
+
+            TaskSpacePathSample sample;
+            sample.pos = oMf_ee.translation();
+            sample.q = q_stage;
+
+            if (has_prev) {
+                cumulative_s += task_space_metric(prev_pos, sample.pos);
+            }
+            sample.path_s = cumulative_s;
+
+            task_space_path_samples_.push_back(sample);
+            prev_pos = sample.pos;
+            has_prev = true;
+        }
+    }
+
+    // [修改] 根据当前末端位置，在“尚未走过的路径后缀”里寻找最近样本，保证进度单调前进。
+    std::size_t find_closest_path_sample_index(const Vec3& current_ee_pos) {
+        if (task_space_path_samples_.empty()) {
+            return 0;
+        }
+
+        std::size_t best_index = task_space_path_progress_index_;
+        double best_metric = 1.0e18;
+
+        for (std::size_t i = task_space_path_progress_index_; i < task_space_path_samples_.size(); ++i) {
+            const auto& sample = task_space_path_samples_[i];
+            const double metric = task_space_metric(current_ee_pos, sample.pos);
+            if (metric < best_metric) {
+                best_metric = metric;
+                best_index = i;
+            }
+        }
+
+        return best_index;
+    }
+
+    // [修改] 按路径弧长插值，而不是按 time_from_start 插值。
+    TaskSpacePathSample interpolate_task_space_sample_by_path_s(double query_s) const {
+        if (task_space_path_samples_.empty()) {
+            return TaskSpacePathSample{};
+        }
+        if (query_s <= task_space_path_samples_.front().path_s) {
+            return task_space_path_samples_.front();
+        }
+        if (query_s >= task_space_path_samples_.back().path_s) {
+            return task_space_path_samples_.back();
+        }
+
+        std::size_t seg_idx = 0;
+        while (seg_idx + 1 < task_space_path_samples_.size() &&
+               task_space_path_samples_[seg_idx + 1].path_s < query_s) {
+            ++seg_idx;
+        }
+
+        const auto& sample_0 = task_space_path_samples_[seg_idx];
+        const auto& sample_1 = task_space_path_samples_[seg_idx + 1];
+        const double s0 = sample_0.path_s;
+        const double s1 = sample_1.path_s;
+        const double alpha = (s1 > s0) ? std::clamp((query_s - s0) / (s1 - s0), 0.0, 1.0) : 0.0;
+
+        TaskSpacePathSample sample;
+        sample.path_s = query_s;
+        sample.pos = (1.0 - alpha) * sample_0.pos + alpha * sample_1.pos;
+        sample.q = (1.0 - alpha) * sample_0.q + alpha * sample_1.q;
+        return sample;
+    }
+
+    std::vector<NMPCStageReference> build_terminal_hold_stage_refs(const Vec7& current_q) {
         const int N = nmpc_solver_.getN();
         std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
 
-        const Vec3 ee_goal_pos = joint_trajectory_ee_goal_pose_.translation();
-        const Mat3 ee_goal_rot = joint_trajectory_ee_goal_pose_.rotation();
+        Vec3 ee_goal_pos = Vec3::Zero();
+        Mat3 ee_goal_rot = Mat3::Identity();
+        get_desired_goal_pose(ee_goal_pos, ee_goal_rot);
 
         for (auto& stage_ref : stage_refs) {
             stage_ref.target_pos = ee_goal_pos;
             stage_ref.target_rot = ee_goal_rot;
-            stage_ref.q_nom = joint_trajectory_goal_q_;
+            stage_ref.q_nom = current_q;  // [修改] 终端保持不再被 MoveIt goal q 或 ready pose 额外拉扯。
             stage_ref.ee_lin_vel_ref.setZero();
             stage_ref.ee_ang_vel_ref.setZero();
         }
@@ -247,15 +397,78 @@ private:
         return stage_refs;
     }
 
+    // [修改] 用“路径进度 + 前视距离”生成整条 horizon 参考。
+    std::vector<NMPCStageReference> build_path_progress_stage_refs(
+        const Vec7& current_q,
+        const Vec7& current_v) {
+        const int N = nmpc_solver_.getN();
+        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+
+        if (task_space_path_samples_.empty()) {
+            Vec3 ee_pos = Vec3::Zero();
+            Mat3 ee_rot = Mat3::Identity();
+            compute_current_ee_pose(ee_pos, ee_rot);
+
+            for (auto& stage_ref : stage_refs) {
+                stage_ref.target_pos = ee_pos;
+                stage_ref.target_rot = ee_rot;
+                stage_ref.q_nom = current_q;
+                stage_ref.ee_lin_vel_ref.setZero();
+                stage_ref.ee_ang_vel_ref.setZero();
+            }
+            return stage_refs;
+        }
+
+        Vec3 current_ee_pos = Vec3::Zero();
+        Mat3 current_ee_rot = Mat3::Identity();
+        compute_current_ee_pose(current_ee_pos, current_ee_rot);
+
+        task_space_path_progress_index_ = find_closest_path_sample_index(current_ee_pos);
+        const double current_path_s = task_space_path_samples_[task_space_path_progress_index_].path_s;
+
+        for (int stage = 0; stage <= N; ++stage) {
+            const double query_s = current_path_s + stage * trajectory_path_stage_spacing_;
+            const TaskSpacePathSample sample = interpolate_task_space_sample_by_path_s(query_s);
+
+            auto& stage_ref = stage_refs[static_cast<std::size_t>(stage)];
+            stage_ref.target_pos = sample.pos;
+            stage_ref.target_rot =
+                build_progress_based_orientation_reference(current_ee_rot, query_s);  // [修改] 不再跟随 MoveIt 的 sample.rot。
+
+            // [修改] q_nom 改为当前关节角，作为纯局部平滑/正则项，不再引入与当前路径无关的 ready pose 偏置。
+            stage_ref.q_nom = current_q;
+
+            // [修改] 当前阶段先不给绝对时间意义上的末端速度参考，避免重新把 NMPC 拉回 time tracking。
+            stage_ref.ee_lin_vel_ref.setZero();
+            stage_ref.ee_ang_vel_ref.setZero();
+        }
+
+        // [修改] 强制把 terminal stage 锚定到手动设置/外部订阅得到的最终目标位姿。
+        // 这样 acados 的 terminal cost 始终盯住真实 goal，而不是盯住 MoveIt 路径前视点。
+        Vec3 desired_goal_pos = Vec3::Zero();
+        Mat3 desired_goal_rot = Mat3::Identity();
+        get_desired_goal_pose(desired_goal_pos, desired_goal_rot);
+
+        auto& terminal_ref = stage_refs.back();
+        terminal_ref.target_pos = desired_goal_pos;
+        terminal_ref.target_rot = desired_goal_rot;
+        terminal_ref.q_nom = current_q;
+        terminal_ref.ee_lin_vel_ref.setZero();
+        terminal_ref.ee_ang_vel_ref.setZero();
+
+        return stage_refs;
+    }
+
     bool is_trajectory_tracking_complete(
-        const double time_duration,
         const Vec7& current_q,
         const Vec7& current_v
     ) {
-        if (joint_trajectory_.points.empty()) {
+        if (task_space_path_samples_.empty()) {
             return false;
         }
-        if (time_duration < get_joint_trajectory_total_duration()) {
+
+        // [修改] 不再要求“墙钟时间超过 MoveIt 轨迹总时长”；只要已经推进到路径末端附近，就按终点误差判断完成。
+        if (task_space_path_progress_index_ + 1 < task_space_path_samples_.size()) {
             return false;
         }
 
@@ -269,7 +482,13 @@ private:
             pin_model_, *pin_data_, ee_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J_lwa);
 
         const pinocchio::SE3& oMf_current = pin_data_->oMf[ee_frame_id_];
-        const pinocchio::SE3 err_M = oMf_current.actInv(joint_trajectory_ee_goal_pose_);
+
+        Vec3 desired_goal_pos = Vec3::Zero();
+        Mat3 desired_goal_rot = Mat3::Identity();
+        get_desired_goal_pose(desired_goal_pos, desired_goal_rot);
+        const pinocchio::SE3 desired_goal_pose(desired_goal_rot, desired_goal_pos);
+
+        const pinocchio::SE3 err_M = oMf_current.actInv(desired_goal_pose);
         const Eigen::Matrix<double, 6, 1> err = pinocchio::log6(err_M).toVector();
         const Eigen::Matrix<double, 6, 1> ee_twist = J_lwa.leftCols<7>() * current_v;
 
@@ -277,114 +496,6 @@ private:
                err.tail<3>().norm() < ee_frame_rot_tolerance_ &&
                ee_twist.head<3>().norm() < ee_frame_lin_vel_tolerance_ &&
                ee_twist.tail<3>().norm() < ee_frame_ang_vel_tolerance_;
-    }
-
-    std::vector<NMPCStageReference> joint_trajectory_resample(const double& time_duration) {
-        const double dt = nmpc_solver_.getDt();
-        const int N = nmpc_solver_.getN();
-
-        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
-        if (joint_trajectory_.points.empty()) {
-            Vec3 ee_pos = Vec3::Zero();
-            Mat3 ee_rot = Mat3::Identity();
-            compute_current_ee_pose(ee_pos, ee_rot);
-
-            for (auto& stage_ref : stage_refs) {
-                // 这里不会导致控制发散？
-                stage_ref.target_pos = ee_pos;
-                stage_ref.target_rot = ee_rot;
-                stage_ref.q_nom = jq_.head<7>();
-                stage_ref.ee_lin_vel_ref.setZero();
-                stage_ref.ee_ang_vel_ref.setZero();
-            }
-            return stage_refs;
-        }
-
-        const auto point_time_sec = [](const trajectory_msgs::msg::JointTrajectoryPoint& point) {
-            return rclcpp::Duration(point.time_from_start).seconds();
-        };
-
-        const auto sample_joint_state =
-            [this](const trajectory_msgs::msg::JointTrajectoryPoint& point, Vec7& q, Vec7& dq) {
-                q.setZero();
-                dq.setZero();
-                for (size_t joint = 0; joint < ordered_names_.size(); ++joint) {
-                    const int msg_index = trajectory_joint_index_map_[joint];
-                    q(static_cast<Eigen::Index>(joint)) = point.positions[static_cast<std::size_t>(msg_index)];
-                    if (point.velocities.size() > static_cast<std::size_t>(msg_index)) {
-                        dq(static_cast<Eigen::Index>(joint)) =
-                            point.velocities[static_cast<std::size_t>(msg_index)];
-                    }
-                }
-            };
-
-        const auto& points = joint_trajectory_.points;
-        const double first_time = point_time_sec(points.front());
-        const double last_time = point_time_sec(points.back());
-        std::size_t seg_idx = 0;
-
-        for (int stage = 0; stage <= N; ++stage) {
-            const double query_time = time_duration + stage * dt;
-
-            Vec7 q_stage = Vec7::Zero();
-            Vec7 dq_stage = Vec7::Zero();
-
-            if (query_time <= first_time) {
-                sample_joint_state(points.front(), q_stage, dq_stage);
-            } else if (query_time >= last_time) {
-                sample_joint_state(points.back(), q_stage, dq_stage);
-                dq_stage.setZero();  // 超出轨迹末端后保持末端姿态，速度参考收敛到 0。
-            } else {
-                while (seg_idx + 1 < points.size() && point_time_sec(points[seg_idx + 1]) < query_time) {
-                    ++seg_idx;
-                }
-
-                const auto& point_0 = points[seg_idx];
-                const auto& point_1 = points[seg_idx + 1];
-                const double t0 = point_time_sec(point_0);
-                const double t1 = point_time_sec(point_1);
-                const double alpha = std::clamp((query_time - t0) / (t1 - t0), 0.0, 1.0);
-                const double inv_alpha = 1.0 - alpha;
-
-                for (size_t joint = 0; joint < ordered_names_.size(); ++joint) {
-                    const int msg_index = trajectory_joint_index_map_[joint];
-                    const std::size_t idx = static_cast<std::size_t>(msg_index);
-
-                    const double q0 = point_0.positions[idx];
-                    const double q1 = point_1.positions[idx];
-                    q_stage(static_cast<Eigen::Index>(joint)) = inv_alpha * q0 + alpha * q1;
-
-                    if (point_0.velocities.size() > idx && point_1.velocities.size() > idx) {
-                        const double dq0 = point_0.velocities[idx];
-                        const double dq1 = point_1.velocities[idx];
-                        dq_stage(static_cast<Eigen::Index>(joint)) = inv_alpha * dq0 + alpha * dq1;
-                    } else {
-                        dq_stage(static_cast<Eigen::Index>(joint)) = (q1 - q0) / (t1 - t0);
-                    }
-                }
-            }
-
-            pinocchio::forwardKinematics(pin_model_, *pin_data_, q_stage, dq_stage);
-            pinocchio::computeJointJacobians(pin_model_, *pin_data_, q_stage);
-            pinocchio::updateFramePlacements(pin_model_, *pin_data_);
-
-            Eigen::Matrix<double, 6, Eigen::Dynamic> J_lwa(6, pin_model_.nv);
-            J_lwa.setZero();
-            pinocchio::getFrameJacobian(
-                pin_model_, *pin_data_, ee_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J_lwa);
-
-            const pinocchio::SE3& oMf_ee = pin_data_->oMf[ee_frame_id_];
-            const Eigen::Matrix<double, 6, 1> ee_twist = J_lwa.leftCols<7>() * dq_stage;
-
-            auto& stage_ref = stage_refs[static_cast<std::size_t>(stage)];
-            stage_ref.target_pos = oMf_ee.translation();
-            stage_ref.target_rot = oMf_ee.rotation();
-            stage_ref.q_nom = q_stage;
-            stage_ref.ee_lin_vel_ref = ee_twist.head<3>();
-            stage_ref.ee_ang_vel_ref = ee_twist.tail<3>();
-        }
-
-        return stage_refs;
     }
 
     void timer_callback() {
@@ -429,17 +540,18 @@ private:
                     [[fallthrough]];
                 case JointTrajectoryState::kTrajectoryUsing :
                 {
-                    const double time_duration = this->now().seconds() - last_joint_trajectory_start_time_;
-                    res = nmpc_solver_.NMPCSolveTrajectory(joint_trajectory_resample(time_duration), current_q, current_v);
-                    if (is_trajectory_tracking_complete(time_duration, current_q, current_v)) {
+                    // [修改] 由“按 time_duration 重采样”改成“按当前路径进度生成前视参考”。
+                    res = nmpc_solver_.NMPCSolveTrajectory(
+                        build_path_progress_stage_refs(current_q, current_v), current_q, current_v);
+                    if (is_trajectory_tracking_complete(current_q, current_v)) {
                         trajectory_state_ = JointTrajectoryState::kTrajectoryComplete;
-                        RCLCPP_INFO(this->get_logger(), "Global joint trajectory completed, switching to terminal hold.");
+                        RCLCPP_INFO(this->get_logger(), "Global path tracking completed, switching to terminal hold.");
                     }
                     break;
                 }
                 case JointTrajectoryState::kTrajectoryComplete :
                     res = nmpc_solver_.NMPCSolveTrajectory(
-                        build_terminal_hold_stage_refs(), current_q, current_v);
+                        build_terminal_hold_stage_refs(current_q), current_q, current_v);
                     break;
             }
         }
@@ -453,6 +565,22 @@ private:
                 "NMPC solve failed, status=%d, keep last good command.", res.status);
             publish_result(nmpc_res_last_);
         }
+    }
+
+    void target_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+        target_pos_ << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
+
+        Eigen::Quaterniond target_quat(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z);
+        if (target_quat.norm() < 1.0e-9) {
+            RCLCPP_WARN(this->get_logger(), "Received invalid target pose quaternion, ignore orientation update.");
+        } else {
+            target_rot_ = target_quat.normalized().toRotationMatrix();
+        }
+
     }
 
     void joint_states_callback(const sensor_msgs::msg::JointState::SharedPtr msg) {
@@ -490,7 +618,7 @@ private:
             trajectory_joint_index_map_[i] = index;
         }
 
-        // [修改] 轨迹采样依赖 time_from_start 做插值，必须保证严格递增。
+        // [修改] 虽然不再按 time_from_start 做在线重采样，但仍保留严格递增检查，防止上游发来的轨迹异常。
         for (size_t i = 0; i < msg->points.size(); ++i) {
             const auto& point = msg->points[i];
             if (point.positions.size() < ordered_names_.size()) {
@@ -510,17 +638,11 @@ private:
                 return;
             }
         }
-        
+
         joint_trajectory_ = *msg;
 
-        const auto& last_point = joint_trajectory_.points.back();
-        for (size_t i = 0; i < ordered_names_.size(); ++i) {
-            const int joint_msg_index = trajectory_joint_index_map_[i];
-            joint_trajectory_goal_q_(static_cast<Eigen::Index>(i)) = last_point.positions[joint_msg_index];
-        }
-        pinocchio::forwardKinematics(pin_model_, *pin_data_, joint_trajectory_goal_q_);
-        pinocchio::updateFramePlacements(pin_model_, *pin_data_);
-        joint_trajectory_ee_goal_pose_ = pin_data_->oMf[ee_frame_id_];
+        // [修改] 新增：在收到新轨迹时，把 joint trajectory 一次性转成 task-space path samples。
+        build_task_space_path_samples_from_joint_trajectory();
 
         // [修改] 收到新轨迹后总是重置为 ready，并切到全局轨迹模式。
         last_joint_trajectory_start_time_ = -1.0;
@@ -529,8 +651,8 @@ private:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Received global joint trajectory with %zu points. Switched to global trajectory mode.",
-            joint_trajectory_.points.size());
+            "Received global joint trajectory with %zu points and built %zu task-space path samples. Switched to global trajectory mode.",
+            joint_trajectory_.points.size(), task_space_path_samples_.size());
     }
 
 public:
@@ -556,10 +678,14 @@ public:
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             joint_states_topic_, 10,
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) { joint_states_callback(msg); });
-        
+
         joint_trajectory_sub_ = this->create_subscription<trajectory_msgs::msg::JointTrajectory> (
-            joint_trajectory_topic_, 10, 
+            joint_trajectory_topic_, 10,
             [this](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) { joint_trajectory_callback(msg); });
+
+        target_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            target_pose_topic_, 10,
+            [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) { target_pose_callback(msg); });
 
         nmpc_res_pub_ = this->create_publisher<panda_interfaces::msg::ResultNMPC>(nmpc_result_topic_, 1);
         timer_ = this->create_wall_timer(std::chrono::milliseconds(static_cast<int64_t>(nmpc_solver_.getDt() * 1000)), [this]() { timer_callback(); });
@@ -568,12 +694,13 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "NMPC node configured. use_global_trajectory=%s, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, result_topic=%s",
+            "NMPC node configured. use_global_trajectory=%s, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, target_pose_topic=%s, result_topic=%s",
             use_global_trajectory_ ? "true" : "false",
             urdf_path_.c_str(),
             ee_frame_name_.c_str(),
             joint_states_topic_.c_str(),
             joint_trajectory_topic_.c_str(),
+            target_pose_topic_.c_str(),
             nmpc_result_topic_.c_str());
     }
 };
