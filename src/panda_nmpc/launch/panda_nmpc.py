@@ -73,6 +73,7 @@ def launch_setup(context, *args, **kwargs):
     robot_description = {"robot_description": ParameterValue(value=robot_description_str, value_type=str)}
 
     parameters_file = PathJoinSubstitution([pkg_share, "config", "pinoController.yaml"])
+    nmpc_parameters_file = LaunchConfiguration("nmpc_params_file")
 
     nodes = []
 
@@ -91,6 +92,7 @@ def launch_setup(context, *args, **kwargs):
             package="panda_nmpc",
             executable="nmpc_tau",
             output="both",
+            parameters=[ParameterFile(nmpc_parameters_file, allow_substs=True)],
             # on_exit=Shutdown(),
         )
     )
@@ -144,10 +146,16 @@ def generate_launch_description():
         default_value="false",
         description="Run simulation without visualization window",
     )
+    nmpc_params_file = DeclareLaunchArgument(
+        "nmpc_params_file",
+        default_value=PathJoinSubstitution([FindPackageShare("panda_nmpc"), "config", "nmpc_tau.yaml"]),
+        description="Parameter file for panda_nmpc::nmpc_tau",
+    )
 
     return LaunchDescription(
         [
             headless,
+            nmpc_params_file,
             OpaqueFunction(function=launch_setup),
         ]
     )

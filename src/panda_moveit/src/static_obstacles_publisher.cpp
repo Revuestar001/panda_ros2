@@ -107,13 +107,13 @@ private:
   double obstacle_1_x_{0.4};
   double obstacle_1_y_{-0.1};
   double obstacle_1_z_{0.35};
-  double obstacle_1_radius_{0.1};
+  double obstacle_1_radius_{0.2};
 
   bool obstacle_2_enabled_{true};
   double obstacle_2_x_{0.4};
   double obstacle_2_y_{0.1};
   double obstacle_2_z_{0.35};
-  double obstacle_2_radius_{0.1};
+  double obstacle_2_radius_{0.2};
 };
 
 int main(int argc, char** argv) {

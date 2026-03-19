@@ -135,6 +135,7 @@ install(TARGETS nmpc_tau nmpc_tau_original
 
 install(DIRECTORY
   launch
+  config
   DESTINATION share/${PROJECT_NAME}
 )
 

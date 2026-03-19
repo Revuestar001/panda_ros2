@@ -1,0 +1,77 @@
+nmpc_tau_node:
+  ros__parameters:
+    use_sim_time: true
+    use_global_trajectory: false
+
+    ee_frame_name: "ee_center_body"
+    joint_states_topic: "/joint_states"
+    joint_trajectory_topic: "/global_joint_trajectory"
+    nmpc_result_topic: "/nmpc_result"
+    target_pose_topic: "/global_target_pose"
+
+    target_x: 0.74
+    target_y: 0.0
+    target_z: 0.25
+    target_qx: 1.0
+    target_qy: 0.0
+    target_qz: 0.0
+    target_qw: 0.0
+
+    ee_frame_pos_tolerance: 0.001
+    ee_frame_rot_tolerance: 0.01
+    ee_frame_lin_vel_tolerance: 0.02
+    ee_frame_ang_vel_tolerance: 0.1
+
+    sorr_pos_damping_ratio: 1.0
+    sorr_pos_natural_frequency: 10.0
+    sorr_pos_max_linear_velocity: 1.0
+    sorr_pos_max_linear_acceleration: 10.0
+
+    sorr_rot_damping_ratio: 1.0
+    sorr_rot_natural_frequency: 10.0
+    sorr_rot_max_angular_velocity: 0.7845
+    sorr_rot_max_angular_acceleration: 0.7845
+
+    carrot_lookahead_distance: 0.06
+    carrot_min_lookahead_distance: 0.04
+    carrot_max_lookahead_distance: 0.12
+    carrot_lookahead_velocity_gain: 0.08
+    carrot_reached_tolerance: 0.015
+    carrot_goal_switch_distance: 0.03
+    carrot_joint_metric_weight: 0.02
+    carrot_use_path_orientation: false
+    progress_search_window_distance: 0.12
+    progress_search_window_points: 12
+
+    cost_pos: [2000.0, 2000.0, 2000.0]
+    cost_rot: [100.0, 100.0, 100.0]
+    cost_ee_lin_vel: [5.0, 5.0, 5.0]
+    cost_ee_ang_vel: [2.0, 2.0, 2.0]
+    cost_dq_reg: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    cost_ddq_reg: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+    cost_neutral_q_reg: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
+    cost_pos_e: [4000.0, 4000.0, 4000.0]
+    cost_rot_e: [2000.0, 2000.0, 2000.0]
+    cost_ee_lin_vel_e: [10.0, 10.0, 10.0]
+    cost_ee_ang_vel_e: [4.0, 4.0, 4.0]
+    cost_dq_reg_e: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+    cost_neutral_q_reg_e: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+    cost_q_neutral: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+
+    cost_joint_limit_barrier: 0.0
+    cost_joint_limit_barrier_e: 0.0
+    cost_manipulability: 0.0
+    cost_manipulability_e: 0.0
+    cost_clearance: 0.0
+    cost_clearance_e: 0.0
+    cost_barrier_eps: 0.0001
+    cost_manipulability_eps: 0.000001
+    cost_clearance_activation_margin: 0.01
+    cost_clearance_softplus_gain: 4.0
+
+    slack_safe_linear: 1000.0
+    slack_safe_quadratic: 10000.0
+    slack_approach_linear: 200.0
+    slack_approach_quadratic: 2000.0

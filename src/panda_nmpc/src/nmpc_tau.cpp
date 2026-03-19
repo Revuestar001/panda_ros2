@@ -32,7 +32,18 @@ private:
     struct TaskSpacePathSample {
         double path_s{0.0};
         Vec3 pos{Vec3::Zero()};
+        Mat3 rot{Mat3::Identity()};
         Vec7 q{Vec7::Zero()};
+    };
+
+    struct CarrotTarget {
+        Vec3 target_pos{Vec3::Zero()};
+        Mat3 target_rot{Mat3::Identity()};
+        Vec7 q_nom{Vec7::Zero()};
+        std::size_t progress_index{0};
+        std::size_t carrot_index{0};
+        double lookahead_distance{0.0};
+        bool terminal_hold{false};
     };
 
     enum class JointTrajectoryState {
@@ -45,6 +56,7 @@ private:
     // nmpc
     PandaNMPCController nmpc_solver_;
     NMPCResult nmpc_res_last_;
+    NMPCRuntimeCostConfig nmpc_cost_config_;
 
     // sorr
     SecondOrderReferenceRegulator sorr_pos_;
@@ -66,13 +78,22 @@ private:
     // global joint trajectory
     trajectory_msgs::msg::JointTrajectory joint_trajectory_;
     JointTrajectoryState trajectory_state_{JointTrajectoryState::kTrajectoryNull};
-    double last_joint_trajectory_start_time_{-1.0};
     std::array<int, 7> trajectory_joint_index_map_{};
 
-    // [修改] 预先把 MoveIt 关节轨迹转成任务空间路径样本；NMPC 后续按“路径进度”而不是“绝对时间”取参考。
+    // 关节路径只作为无时间的全局几何引导；每个控制周期只选一个前视胡萝卜点。
     std::vector<TaskSpacePathSample> task_space_path_samples_;
     std::size_t task_space_path_progress_index_{0};
-    double trajectory_path_stage_spacing_{0.015};
+    std::size_t active_carrot_index_{0};
+    double carrot_lookahead_distance_{0.06};
+    double carrot_min_lookahead_distance_{0.04};
+    double carrot_max_lookahead_distance_{0.12};
+    double carrot_lookahead_velocity_gain_{0.08};
+    double carrot_reached_tolerance_{0.015};
+    double carrot_goal_switch_distance_{0.03};
+    double carrot_joint_metric_weight_{0.02};
+    bool carrot_use_path_orientation_{false};
+    double progress_search_window_distance_{0.12};
+    int progress_search_window_points_{12};
 
     double ee_frame_pos_tolerance_{1e-3};
     double ee_frame_rot_tolerance_{1e-1};
@@ -119,6 +140,88 @@ private:
         }
     }
 
+    template <int N>
+    Eigen::Matrix<double, N, 1> declare_fixed_vector_parameter(
+        const std::string& name,
+        const std::array<double, N>& default_values
+    ) {
+        const std::vector<double> default_vec(default_values.begin(), default_values.end());
+        const auto value = this->declare_parameter<std::vector<double>>(name, default_vec);
+        if (value.size() != static_cast<std::size_t>(N)) {
+            throw std::runtime_error(
+                "Parameter '" + name + "' must have exactly " + std::to_string(N) + " elements.");
+        }
+
+        Eigen::Matrix<double, N, 1> result;
+        for (int i = 0; i < N; ++i) {
+            result(i) = value[static_cast<std::size_t>(i)];
+        }
+        return result;
+    }
+
+    void load_nmpc_runtime_cost_parameters() {
+        nmpc_cost_config_.pos = declare_fixed_vector_parameter<3>(
+            "cost_pos", {500.0, 500.0, 500.0});
+        nmpc_cost_config_.rot = declare_fixed_vector_parameter<3>(
+            "cost_rot", {100.0, 100.0, 100.0});
+        nmpc_cost_config_.ee_lin_vel = declare_fixed_vector_parameter<3>(
+            "cost_ee_lin_vel", {5.0, 5.0, 5.0});
+        nmpc_cost_config_.ee_ang_vel = declare_fixed_vector_parameter<3>(
+            "cost_ee_ang_vel", {2.0, 2.0, 2.0});
+        nmpc_cost_config_.dq_reg = declare_fixed_vector_parameter<7>(
+            "cost_dq_reg", {0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1});
+        nmpc_cost_config_.ddq_reg = declare_fixed_vector_parameter<7>(
+            "cost_ddq_reg", {0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05});
+        nmpc_cost_config_.neutral_q_reg = declare_fixed_vector_parameter<7>(
+            "cost_neutral_q_reg", {15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0});
+
+        nmpc_cost_config_.pos_e = declare_fixed_vector_parameter<3>(
+            "cost_pos_e", {750.0, 750.0, 750.0});
+        nmpc_cost_config_.rot_e = declare_fixed_vector_parameter<3>(
+            "cost_rot_e", {200.0, 200.0, 200.0});
+        nmpc_cost_config_.ee_lin_vel_e = declare_fixed_vector_parameter<3>(
+            "cost_ee_lin_vel_e", {10.0, 10.0, 10.0});
+        nmpc_cost_config_.ee_ang_vel_e = declare_fixed_vector_parameter<3>(
+            "cost_ee_ang_vel_e", {4.0, 4.0, 4.0});
+        nmpc_cost_config_.dq_reg_e = declare_fixed_vector_parameter<7>(
+            "cost_dq_reg_e", {0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2});
+        nmpc_cost_config_.neutral_q_reg_e = declare_fixed_vector_parameter<7>(
+            "cost_neutral_q_reg_e", {30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0});
+
+        nmpc_cost_config_.q_neutral = declare_fixed_vector_parameter<7>(
+            "cost_q_neutral", {0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854});
+
+        nmpc_cost_config_.joint_limit_barrier =
+            this->declare_parameter<double>("cost_joint_limit_barrier", 0.05);
+        nmpc_cost_config_.joint_limit_barrier_e =
+            this->declare_parameter<double>("cost_joint_limit_barrier_e", 0.08);
+        nmpc_cost_config_.manipulability =
+            this->declare_parameter<double>("cost_manipulability", 5.0);
+        nmpc_cost_config_.manipulability_e =
+            this->declare_parameter<double>("cost_manipulability_e", 8.0);
+        nmpc_cost_config_.clearance =
+            this->declare_parameter<double>("cost_clearance", 180.0);
+        nmpc_cost_config_.clearance_e =
+            this->declare_parameter<double>("cost_clearance_e", 260.0);
+        nmpc_cost_config_.barrier_eps =
+            this->declare_parameter<double>("cost_barrier_eps", 1.0e-4);
+        nmpc_cost_config_.manipulability_eps =
+            this->declare_parameter<double>("cost_manipulability_eps", 1.0e-6);
+        nmpc_cost_config_.clearance_activation_margin =
+            this->declare_parameter<double>("cost_clearance_activation_margin", 0.06);
+        nmpc_cost_config_.clearance_softplus_gain =
+            this->declare_parameter<double>("cost_clearance_softplus_gain", 40.0);
+
+        nmpc_cost_config_.safe_slack_linear =
+            this->declare_parameter<double>("slack_safe_linear", 1.0e4);
+        nmpc_cost_config_.safe_slack_quadratic =
+            this->declare_parameter<double>("slack_safe_quadratic", 1.0e6);
+        nmpc_cost_config_.approach_slack_linear =
+            this->declare_parameter<double>("slack_approach_linear", 2.0e3);
+        nmpc_cost_config_.approach_slack_quadratic =
+            this->declare_parameter<double>("slack_approach_quadratic", 2.0e5);
+    }
+
     void declare_startup_parameters() {
         urdf_path_ = this->declare_parameter<std::string>("urdf_path", default_panda_urdf_path());
         ee_frame_name_ = this->declare_parameter<std::string>("ee_frame_name", "ee_center_body");
@@ -161,9 +264,26 @@ private:
         sorr_rot_max_angular_acceleration_ =
             this->declare_parameter<double>("sorr_rot_max_angular_acceleration", 0.7845);
 
-        // [修改] 用路径弧长而不是 time_from_start 推 horizon 参考。
-        trajectory_path_stage_spacing_ =
-            this->declare_parameter<double>("trajectory_path_stage_spacing", 0.015);
+        carrot_lookahead_distance_ =
+            this->declare_parameter<double>("carrot_lookahead_distance", 0.06);
+        carrot_min_lookahead_distance_ =
+            this->declare_parameter<double>("carrot_min_lookahead_distance", 0.04);
+        carrot_max_lookahead_distance_ =
+            this->declare_parameter<double>("carrot_max_lookahead_distance", 0.12);
+        carrot_lookahead_velocity_gain_ =
+            this->declare_parameter<double>("carrot_lookahead_velocity_gain", 0.08);
+        carrot_reached_tolerance_ =
+            this->declare_parameter<double>("carrot_reached_tolerance", 0.015);
+        carrot_goal_switch_distance_ =
+            this->declare_parameter<double>("carrot_goal_switch_distance", 0.03);
+        carrot_joint_metric_weight_ =
+            this->declare_parameter<double>("carrot_joint_metric_weight", 0.02);
+        carrot_use_path_orientation_ =
+            this->declare_parameter<bool>("carrot_use_path_orientation", false);
+        progress_search_window_distance_ =
+            this->declare_parameter<double>("progress_search_window_distance", 0.12);
+        progress_search_window_points_ =
+            this->declare_parameter<int>("progress_search_window_points", 12);
     }
 
     void initialize_pinocchio() {
@@ -229,23 +349,17 @@ private:
         goal_rot = target_rot_;
     }
 
-    // [修改] 在全局路径模式下，中间 stage 的姿态参考不再直接跟随 MoveIt 的 sample.rot，
-    // 而是沿“当前姿态 -> 最终目标姿态”做渐进插值，从而只借用 MoveIt 的位置路径，不借用其整段姿态时间表。
-    Mat3 build_progress_based_orientation_reference(
-        const Mat3& current_ee_rot,
-        double query_s) const {
-        Vec3 goal_pos = Vec3::Zero();
-        Mat3 goal_rot = Mat3::Identity();
-        get_desired_goal_pose(goal_pos, goal_rot);
+    double compute_current_ee_linear_speed(const Vec7& current_q, const Vec7& current_v) {
+        pinocchio::forwardKinematics(pin_model_, *pin_data_, current_q, current_v);
+        pinocchio::computeJointJacobians(pin_model_, *pin_data_, current_q);
+        pinocchio::updateFramePlacements(pin_model_, *pin_data_);
 
-        const double total_s =
-            task_space_path_samples_.empty() ? 0.0 : task_space_path_samples_.back().path_s;
-        const double alpha =
-            (total_s > 1.0e-9) ? std::clamp(query_s / total_s, 0.0, 1.0) : 1.0;
+        Eigen::Matrix<double, 6, Eigen::Dynamic> J_lwa(6, pin_model_.nv);
+        J_lwa.setZero();
+        pinocchio::getFrameJacobian(
+            pin_model_, *pin_data_, ee_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J_lwa);
 
-        const Eigen::Quaterniond q_curr(current_ee_rot);
-        const Eigen::Quaterniond q_goal(goal_rot);
-        return q_curr.slerp(alpha, q_goal).normalized().toRotationMatrix();
+        return (J_lwa.leftCols<7>().topRows<3>() * current_v).norm();
     }
 
     void publish_result(const NMPCResult& res) {
@@ -265,32 +379,44 @@ private:
         target_pos_[2] = 0.32;
     }
 
-    // [修改] 统一的关节采样函数，供轨迹接收时预计算任务空间路径使用。
     void sample_joint_state_from_trajectory_point(
         const trajectory_msgs::msg::JointTrajectoryPoint& point,
-        Vec7& q,
-        Vec7& dq) const {
+        Vec7& q) const {
         q.setZero();
-        dq.setZero();
         for (size_t joint = 0; joint < ordered_names_.size(); ++joint) {
             const int msg_index = trajectory_joint_index_map_[joint];
             const std::size_t idx = static_cast<std::size_t>(msg_index);
             q(static_cast<Eigen::Index>(joint)) = point.positions[idx];
-            if (point.velocities.size() > idx) {
-                dq(static_cast<Eigen::Index>(joint)) = point.velocities[idx];
-            }
         }
     }
 
-    // [修改] 路径进度只使用位置距离，彻底去掉 MoveIt 中间姿态对路径跟踪的影响。
+    TaskSpacePathSample build_task_space_sample_from_joint_q(const Vec7& q, double path_s) {
+        pinocchio::forwardKinematics(pin_model_, *pin_data_, q);
+        pinocchio::updateFramePlacements(pin_model_, *pin_data_);
+        const pinocchio::SE3& oMf_ee = pin_data_->oMf[ee_frame_id_];
+
+        TaskSpacePathSample sample;
+        sample.path_s = path_s;
+        sample.pos = oMf_ee.translation();
+        sample.rot = oMf_ee.rotation();
+        sample.q = q;
+        return sample;
+    }
+
     double task_space_metric(const Vec3& pos_a, const Vec3& pos_b) const {
         return (pos_a - pos_b).norm();
     }
 
-    // [修改] 收到 MoveIt 轨迹后，只预计算一遍 task-space path samples。
+    double path_progress_metric(const TaskSpacePathSample& sample, const Vec7& current_q, const Vec3& current_ee_pos) const {
+        const double pos_metric = (sample.pos - current_ee_pos).norm();
+        const double joint_metric = (sample.q - current_q).norm();
+        return pos_metric + carrot_joint_metric_weight_ * joint_metric;
+    }
+
     void build_task_space_path_samples_from_joint_trajectory() {
         task_space_path_samples_.clear();
         task_space_path_progress_index_ = 0;
+        active_carrot_index_ = 0;
 
         if (joint_trajectory_.points.empty()) {
             return;
@@ -304,21 +430,13 @@ private:
 
         for (const auto& point : joint_trajectory_.points) {
             Vec7 q_stage = Vec7::Zero();
-            Vec7 dq_stage = Vec7::Zero();
-            sample_joint_state_from_trajectory_point(point, q_stage, dq_stage);
+            sample_joint_state_from_trajectory_point(point, q_stage);
 
-            pinocchio::forwardKinematics(pin_model_, *pin_data_, q_stage);
-            pinocchio::updateFramePlacements(pin_model_, *pin_data_);
-            const pinocchio::SE3& oMf_ee = pin_data_->oMf[ee_frame_id_];
-
-            TaskSpacePathSample sample;
-            sample.pos = oMf_ee.translation();
-            sample.q = q_stage;
-
+            TaskSpacePathSample sample = build_task_space_sample_from_joint_q(q_stage, cumulative_s);
             if (has_prev) {
                 cumulative_s += task_space_metric(prev_pos, sample.pos);
+                sample.path_s = cumulative_s;
             }
-            sample.path_s = cumulative_s;
 
             task_space_path_samples_.push_back(sample);
             prev_pos = sample.pos;
@@ -326,18 +444,37 @@ private:
         }
     }
 
-    // [修改] 根据当前末端位置，在“尚未走过的路径后缀”里寻找最近样本，保证进度单调前进。
-    std::size_t find_closest_path_sample_index(const Vec3& current_ee_pos) {
+    std::size_t find_closest_path_sample_index(const Vec7& current_q, const Vec3& current_ee_pos) {
         if (task_space_path_samples_.empty()) {
             return 0;
         }
 
-        std::size_t best_index = task_space_path_progress_index_;
+        const std::size_t start_index =
+            std::min(task_space_path_progress_index_, task_space_path_samples_.size() - 1);
+        const std::size_t max_point_advance =
+            static_cast<std::size_t>(std::max(progress_search_window_points_, 0));
+        const double max_window_distance = std::max(progress_search_window_distance_, 0.0);
+        const double start_path_s = task_space_path_samples_[start_index].path_s;
+
+        std::size_t end_index = start_index;
+        while (end_index + 1 < task_space_path_samples_.size()) {
+            const std::size_t next_index = end_index + 1;
+            if (next_index - start_index > max_point_advance) {
+                break;
+            }
+            if (task_space_path_samples_[next_index].path_s - start_path_s > max_window_distance) {
+                break;
+            }
+            end_index = next_index;
+        }
+
+        std::size_t best_index = start_index;
         double best_metric = 1.0e18;
 
-        for (std::size_t i = task_space_path_progress_index_; i < task_space_path_samples_.size(); ++i) {
+        // 只允许在当前进度前方的局部窗口里选最近点，避免在自交/折返路径上直接跳到很后面的段。
+        for (std::size_t i = start_index; i <= end_index; ++i) {
             const auto& sample = task_space_path_samples_[i];
-            const double metric = task_space_metric(current_ee_pos, sample.pos);
+            const double metric = path_progress_metric(sample, current_q, current_ee_pos);
             if (metric < best_metric) {
                 best_metric = metric;
                 best_index = i;
@@ -347,116 +484,80 @@ private:
         return best_index;
     }
 
-    // [修改] 按路径弧长插值，而不是按 time_from_start 插值。
-    TaskSpacePathSample interpolate_task_space_sample_by_path_s(double query_s) const {
+    std::size_t advance_path_index_by_distance(std::size_t start_index, double lookahead_distance) const {
         if (task_space_path_samples_.empty()) {
-            return TaskSpacePathSample{};
-        }
-        if (query_s <= task_space_path_samples_.front().path_s) {
-            return task_space_path_samples_.front();
-        }
-        if (query_s >= task_space_path_samples_.back().path_s) {
-            return task_space_path_samples_.back();
+            return 0;
         }
 
-        std::size_t seg_idx = 0;
-        while (seg_idx + 1 < task_space_path_samples_.size() &&
-               task_space_path_samples_[seg_idx + 1].path_s < query_s) {
-            ++seg_idx;
+        const std::size_t clamped_start = std::min(start_index, task_space_path_samples_.size() - 1);
+        const double target_s = task_space_path_samples_[clamped_start].path_s + std::max(lookahead_distance, 0.0);
+
+        std::size_t idx = clamped_start;
+        while (idx + 1 < task_space_path_samples_.size() &&
+               task_space_path_samples_[idx].path_s < target_s) {
+            ++idx;
         }
-
-        const auto& sample_0 = task_space_path_samples_[seg_idx];
-        const auto& sample_1 = task_space_path_samples_[seg_idx + 1];
-        const double s0 = sample_0.path_s;
-        const double s1 = sample_1.path_s;
-        const double alpha = (s1 > s0) ? std::clamp((query_s - s0) / (s1 - s0), 0.0, 1.0) : 0.0;
-
-        TaskSpacePathSample sample;
-        sample.path_s = query_s;
-        sample.pos = (1.0 - alpha) * sample_0.pos + alpha * sample_1.pos;
-        sample.q = (1.0 - alpha) * sample_0.q + alpha * sample_1.q;
-        return sample;
+        return idx;
     }
 
-    std::vector<NMPCStageReference> build_terminal_hold_stage_refs(const Vec7& current_q) {
-        const int N = nmpc_solver_.getN();
-        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+    CarrotTarget build_carrot_target(const Vec7& current_q, const Vec7& current_v) {
+        CarrotTarget carrot;
 
-        Vec3 ee_goal_pos = Vec3::Zero();
-        Mat3 ee_goal_rot = Mat3::Identity();
-        get_desired_goal_pose(ee_goal_pos, ee_goal_rot);
-
-        for (auto& stage_ref : stage_refs) {
-            stage_ref.target_pos = ee_goal_pos;
-            stage_ref.target_rot = ee_goal_rot;
-            stage_ref.q_nom = current_q;  // [修改] 终端保持不再被 MoveIt goal q 或 ready pose 额外拉扯。
-            stage_ref.ee_lin_vel_ref.setZero();
-            stage_ref.ee_ang_vel_ref.setZero();
-        }
-
-        return stage_refs;
-    }
-
-    // [修改] 用“路径进度 + 前视距离”生成整条 horizon 参考。
-    std::vector<NMPCStageReference> build_path_progress_stage_refs(
-        const Vec7& current_q,
-        const Vec7& current_v) {
-        const int N = nmpc_solver_.getN();
-        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+        Vec3 goal_pos = Vec3::Zero();
+        Mat3 goal_rot = Mat3::Identity();
+        get_desired_goal_pose(goal_pos, goal_rot);
 
         if (task_space_path_samples_.empty()) {
-            Vec3 ee_pos = Vec3::Zero();
-            Mat3 ee_rot = Mat3::Identity();
-            compute_current_ee_pose(ee_pos, ee_rot);
-
-            for (auto& stage_ref : stage_refs) {
-                stage_ref.target_pos = ee_pos;
-                stage_ref.target_rot = ee_rot;
-                stage_ref.q_nom = current_q;
-                stage_ref.ee_lin_vel_ref.setZero();
-                stage_ref.ee_ang_vel_ref.setZero();
-            }
-            return stage_refs;
+            carrot.target_pos = goal_pos;
+            carrot.target_rot = goal_rot;
+            carrot.q_nom = current_q;
+            carrot.terminal_hold = true;
+            return carrot;
         }
 
         Vec3 current_ee_pos = Vec3::Zero();
         Mat3 current_ee_rot = Mat3::Identity();
         compute_current_ee_pose(current_ee_pos, current_ee_rot);
 
-        task_space_path_progress_index_ = find_closest_path_sample_index(current_ee_pos);
-        const double current_path_s = task_space_path_samples_[task_space_path_progress_index_].path_s;
+        task_space_path_progress_index_ = find_closest_path_sample_index(current_q, current_ee_pos);
+        const auto& progress_sample = task_space_path_samples_[task_space_path_progress_index_];
+        const double remaining_s = task_space_path_samples_.back().path_s - progress_sample.path_s;
 
-        for (int stage = 0; stage <= N; ++stage) {
-            const double query_s = current_path_s + stage * trajectory_path_stage_spacing_;
-            const TaskSpacePathSample sample = interpolate_task_space_sample_by_path_s(query_s);
+        carrot.progress_index = task_space_path_progress_index_;
 
-            auto& stage_ref = stage_refs[static_cast<std::size_t>(stage)];
-            stage_ref.target_pos = sample.pos;
-            stage_ref.target_rot =
-                build_progress_based_orientation_reference(current_ee_rot, query_s);  // [修改] 不再跟随 MoveIt 的 sample.rot。
-
-            // [修改] q_nom 改为当前关节角，作为纯局部平滑/正则项，不再引入与当前路径无关的 ready pose 偏置。
-            stage_ref.q_nom = current_q;
-
-            // [修改] 当前阶段先不给绝对时间意义上的末端速度参考，避免重新把 NMPC 拉回 time tracking。
-            stage_ref.ee_lin_vel_ref.setZero();
-            stage_ref.ee_ang_vel_ref.setZero();
+        if (remaining_s <= carrot_goal_switch_distance_) {
+            carrot.target_pos = goal_pos;
+            carrot.target_rot = goal_rot;
+            carrot.q_nom = task_space_path_samples_.back().q;
+            carrot.carrot_index = task_space_path_samples_.size() - 1;
+            carrot.lookahead_distance = 0.0;
+            carrot.terminal_hold = true;
+            active_carrot_index_ = carrot.carrot_index;
+            return carrot;
         }
 
-        // [修改] 强制把 terminal stage 锚定到手动设置/外部订阅得到的最终目标位姿。
-        // 这样 acados 的 terminal cost 始终盯住真实 goal，而不是盯住 MoveIt 路径前视点。
-        Vec3 desired_goal_pos = Vec3::Zero();
-        Mat3 desired_goal_rot = Mat3::Identity();
-        get_desired_goal_pose(desired_goal_pos, desired_goal_rot);
+        const double ee_speed = compute_current_ee_linear_speed(current_q, current_v);
+        carrot.lookahead_distance = std::clamp(
+            carrot_lookahead_distance_ + carrot_lookahead_velocity_gain_ * ee_speed,
+            carrot_min_lookahead_distance_, carrot_max_lookahead_distance_);
 
-        auto& terminal_ref = stage_refs.back();
-        terminal_ref.target_pos = desired_goal_pos;
-        terminal_ref.target_rot = desired_goal_rot;
-        terminal_ref.q_nom = current_q;
-        terminal_ref.ee_lin_vel_ref.setZero();
-        terminal_ref.ee_ang_vel_ref.setZero();
+        std::size_t carrot_index = advance_path_index_by_distance(task_space_path_progress_index_, carrot.lookahead_distance);
+        carrot_index = std::max(carrot_index, task_space_path_progress_index_);
 
-        return stage_refs;
+        while (carrot_index + 1 < task_space_path_samples_.size() &&
+               (task_space_path_samples_[carrot_index].pos - current_ee_pos).norm() < carrot_reached_tolerance_) {
+            ++carrot_index;
+        }
+
+        active_carrot_index_ = carrot_index;
+        carrot.carrot_index = carrot_index;
+        carrot.target_pos = task_space_path_samples_[carrot_index].pos;
+        carrot.target_rot = carrot_use_path_orientation_ && carrot_index + 1 < task_space_path_samples_.size()
+            ? task_space_path_samples_[carrot_index].rot
+            : goal_rot;
+        carrot.q_nom = task_space_path_samples_[carrot_index].q;
+        carrot.terminal_hold = false;
+        return carrot;
     }
 
     bool is_trajectory_tracking_complete(
@@ -467,8 +568,9 @@ private:
             return false;
         }
 
-        // [修改] 不再要求“墙钟时间超过 MoveIt 轨迹总时长”；只要已经推进到路径末端附近，就按终点误差判断完成。
-        if (task_space_path_progress_index_ + 1 < task_space_path_samples_.size()) {
+        const double remaining_s =
+            task_space_path_samples_.back().path_s - task_space_path_samples_[task_space_path_progress_index_].path_s;
+        if (remaining_s > carrot_goal_switch_distance_) {
             return false;
         }
 
@@ -535,23 +637,43 @@ private:
                         "Joints trajectory is null, hold on.");
                     break;
                 case JointTrajectoryState::kTrajectoryReady :
-                    last_joint_trajectory_start_time_ = this->now().seconds();
                     trajectory_state_ = JointTrajectoryState::kTrajectoryUsing;
                     [[fallthrough]];
                 case JointTrajectoryState::kTrajectoryUsing :
                 {
-                    // [修改] 由“按 time_duration 重采样”改成“按当前路径进度生成前视参考”。
-                    res = nmpc_solver_.NMPCSolveTrajectory(
-                        build_path_progress_stage_refs(current_q, current_v), current_q, current_v);
+                    const CarrotTarget carrot = build_carrot_target(current_q, current_v);
+                    res = nmpc_solver_.NMPCSolve(
+                        carrot.target_pos,
+                        carrot.target_rot,
+                        carrot.q_nom,
+                        Vec3::Zero(),
+                        Vec3::Zero(),
+                        current_q,
+                        current_v);
                     if (is_trajectory_tracking_complete(current_q, current_v)) {
                         trajectory_state_ = JointTrajectoryState::kTrajectoryComplete;
                         RCLCPP_INFO(this->get_logger(), "Global path tracking completed, switching to terminal hold.");
+                    } else {
+                        RCLCPP_DEBUG_THROTTLE(
+                            this->get_logger(), *this->get_clock(), 500,
+                            "Carrot tracking: progress=%zu/%zu carrot=%zu/%zu lookahead=%.3f m",
+                            task_space_path_progress_index_,
+                            task_space_path_samples_.empty() ? std::size_t{0} : task_space_path_samples_.size() - 1,
+                            active_carrot_index_,
+                            task_space_path_samples_.empty() ? std::size_t{0} : task_space_path_samples_.size() - 1,
+                            carrot.lookahead_distance);
                     }
                     break;
                 }
                 case JointTrajectoryState::kTrajectoryComplete :
-                    res = nmpc_solver_.NMPCSolveTrajectory(
-                        build_terminal_hold_stage_refs(current_q), current_q, current_v);
+                    res = nmpc_solver_.NMPCSolve(
+                        target_pos_,
+                        target_rot_,
+                        current_q,
+                        Vec3::Zero(),
+                        Vec3::Zero(),
+                        current_q,
+                        current_v);
                     break;
             }
         }
@@ -618,7 +740,6 @@ private:
             trajectory_joint_index_map_[i] = index;
         }
 
-        // [修改] 虽然不再按 time_from_start 做在线重采样，但仍保留严格递增检查，防止上游发来的轨迹异常。
         for (size_t i = 0; i < msg->points.size(); ++i) {
             const auto& point = msg->points[i];
             if (point.positions.size() < ordered_names_.size()) {
@@ -628,15 +749,6 @@ private:
                     i, point.positions.size(), ordered_names_.size());
                 return;
             }
-            if (i > 0 &&
-                rclcpp::Duration(point.time_from_start) <=
-                    rclcpp::Duration(msg->points[i - 1].time_from_start)) {
-                RCLCPP_ERROR(
-                    this->get_logger(),
-                    "Joint trajectory time_from_start is not strictly increasing at point %zu.",
-                    i);
-                return;
-            }
         }
 
         joint_trajectory_ = *msg;
@@ -644,20 +756,22 @@ private:
         // [修改] 新增：在收到新轨迹时，把 joint trajectory 一次性转成 task-space path samples。
         build_task_space_path_samples_from_joint_trajectory();
 
-        // [修改] 收到新轨迹后总是重置为 ready，并切到全局轨迹模式。
-        last_joint_trajectory_start_time_ = -1.0;
         use_global_trajectory_ = true;
         trajectory_state_ = JointTrajectoryState::kTrajectoryReady;
+        task_space_path_progress_index_ = 0;
+        active_carrot_index_ = 0;
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Received global joint trajectory with %zu points and built %zu task-space path samples. Switched to global trajectory mode.",
+            "Received global joint path with %zu points and built %zu path samples. Switched to carrot-following mode.",
             joint_trajectory_.points.size(), task_space_path_samples_.size());
     }
 
 public:
     NMPCNode() : Node("nmpc_tau_node") {
         declare_startup_parameters();
+        load_nmpc_runtime_cost_parameters();
+        nmpc_solver_.setRuntimeCostConfig(nmpc_cost_config_);
         initialize_pinocchio();
 
         reference_q_ = Eigen::VectorXd::Zero(7);
@@ -694,14 +808,18 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "NMPC node configured. use_global_trajectory=%s, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, target_pose_topic=%s, result_topic=%s",
+            "NMPC node configured. use_global_trajectory=%s, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, target_pose_topic=%s, result_topic=%s, cost_pos=(%.1f, %.1f, %.1f), cost_clearance=%.1f",
             use_global_trajectory_ ? "true" : "false",
             urdf_path_.c_str(),
             ee_frame_name_.c_str(),
             joint_states_topic_.c_str(),
             joint_trajectory_topic_.c_str(),
             target_pose_topic_.c_str(),
-            nmpc_result_topic_.c_str());
+            nmpc_result_topic_.c_str(),
+            nmpc_cost_config_.pos.x(),
+            nmpc_cost_config_.pos.y(),
+            nmpc_cost_config_.pos.z(),
+            nmpc_cost_config_.clearance);
     }
 };
 
