@@ -61,6 +61,12 @@ add_library(panda_task_space_nmpc_generated_solver SHARED
 target_include_directories(panda_task_space_nmpc_generated_solver PUBLIC
   ${ACADOS_INCLUDE_DIRS}
 )
+# acados 生成的 Makefile 默认会用 -O2 编译 external functions。
+# 这里直接把 generated C 挂进 package 的 CMake 后，如果 workspace 没显式
+# 指定 Release/RelWithDebInfo，就会退化成“无优化”编译，SQP-RTI 会明显变慢。
+target_compile_options(panda_task_space_nmpc_generated_solver PRIVATE
+  $<$<COMPILE_LANGUAGE:C>:-O2>
+)
 set_target_properties(panda_task_space_nmpc_generated_solver PROPERTIES
   C_STANDARD 99
   C_STANDARD_REQUIRED ON

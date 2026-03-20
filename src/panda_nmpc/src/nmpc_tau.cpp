@@ -107,6 +107,7 @@ private:
     std::vector<panda_nmpc::StaticSphereObstacle> scene_obstacles_;
     ObstacleParamBlock runtime_obstacle_params_{PandaNMPCController::disabledObstacleParams()};
     CostWeights nmpc_cost_weights_{PandaNMPCController::defaultCostWeights()};
+    std::vector<NMPCStageReference> stage_refs_buffer_;
 
     // topic & timer
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
@@ -406,6 +407,15 @@ private:
         return (pos_a - pos_b).norm();
     }
 
+    // [修改] horizon stage_refs 在实时环中反复复用，避免每个 control tick 重新分配 vector。
+    std::vector<NMPCStageReference>& stage_ref_buffer() {
+        const std::size_t required_size = static_cast<std::size_t>(nmpc_solver_.getN() + 1);
+        if (stage_refs_buffer_.size() != required_size) {
+            stage_refs_buffer_.resize(required_size);
+        }
+        return stage_refs_buffer_;
+    }
+
     // [修改] 收到 MoveIt 轨迹后，只预计算一遍 task-space path samples。
     void build_task_space_path_samples_from_joint_trajectory() {
         task_space_path_samples_.clear();
@@ -466,26 +476,32 @@ private:
         return best_index;
     }
 
-    // [修改] 按路径弧长插值，而不是按 time_from_start 插值。
-    TaskSpacePathSample interpolate_task_space_sample_by_path_s(double query_s) const {
+    // [修改] 按路径弧长插值，并复用单调递增的 segment hint，
+    // 避免每个 stage 都从路径起点重新线性扫描一遍。
+    TaskSpacePathSample interpolate_task_space_sample_by_path_s(
+        double query_s,
+        std::size_t& segment_index_hint) const {
         if (task_space_path_samples_.empty()) {
             return TaskSpacePathSample{};
         }
-        if (query_s <= task_space_path_samples_.front().path_s) {
+        if (query_s <= task_space_path_samples_.front().path_s ||
+            task_space_path_samples_.size() == 1) {
+            segment_index_hint = 0;
             return task_space_path_samples_.front();
         }
         if (query_s >= task_space_path_samples_.back().path_s) {
+            segment_index_hint = task_space_path_samples_.size() - 1;
             return task_space_path_samples_.back();
         }
 
-        std::size_t seg_idx = 0;
-        while (seg_idx + 1 < task_space_path_samples_.size() &&
-               task_space_path_samples_[seg_idx + 1].path_s < query_s) {
-            ++seg_idx;
+        segment_index_hint = std::min(segment_index_hint, task_space_path_samples_.size() - 2);
+        while (segment_index_hint + 1 < task_space_path_samples_.size() &&
+               task_space_path_samples_[segment_index_hint + 1].path_s < query_s) {
+            ++segment_index_hint;
         }
 
-        const auto& sample_0 = task_space_path_samples_[seg_idx];
-        const auto& sample_1 = task_space_path_samples_[seg_idx + 1];
+        const auto& sample_0 = task_space_path_samples_[segment_index_hint];
+        const auto& sample_1 = task_space_path_samples_[segment_index_hint + 1];
         const double s0 = sample_0.path_s;
         const double s1 = sample_1.path_s;
         const double alpha = (s1 > s0) ? std::clamp((query_s - s0) / (s1 - s0), 0.0, 1.0) : 0.0;
@@ -497,9 +513,8 @@ private:
         return sample;
     }
 
-    std::vector<NMPCStageReference> build_terminal_hold_stage_refs(const Vec7& current_q) {
-        const int N = nmpc_solver_.getN();
-        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+    const std::vector<NMPCStageReference>& build_terminal_hold_stage_refs(const Vec7& current_q) {
+        auto& stage_refs = stage_ref_buffer();
 
         Vec3 ee_goal_pos = Vec3::Zero();
         Mat3 ee_goal_rot = Mat3::Identity();
@@ -518,11 +533,11 @@ private:
     }
 
     // [修改] 用“路径进度 + 前视距离”生成整条 horizon 参考。
-    std::vector<NMPCStageReference> build_path_progress_stage_refs(
+    const std::vector<NMPCStageReference>& build_path_progress_stage_refs(
         const Vec7& current_q,
         const Vec7& /*current_v*/) {
         const int N = nmpc_solver_.getN();
-        std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
+        auto& stage_refs = stage_ref_buffer();
 
         if (task_space_path_samples_.empty()) {
             Vec3 ee_pos = Vec3::Zero();
@@ -546,10 +561,12 @@ private:
 
         task_space_path_progress_index_ = find_closest_path_sample_index(current_ee_pos);
         const double current_path_s = task_space_path_samples_[task_space_path_progress_index_].path_s;
+        std::size_t segment_index_hint = task_space_path_progress_index_;
 
         for (int stage = 0; stage <= N; ++stage) {
             const double query_s = current_path_s + stage * trajectory_path_stage_spacing_;
-            const TaskSpacePathSample sample = interpolate_task_space_sample_by_path_s(query_s);
+            const TaskSpacePathSample sample =
+                interpolate_task_space_sample_by_path_s(query_s, segment_index_hint);
 
             auto& stage_ref = stage_refs[static_cast<std::size_t>(stage)];
             stage_ref.target_pos = sample.pos;
@@ -785,6 +802,7 @@ public:
         nmpc_solver_.setCostWeights(nmpc_cost_weights_);
         load_static_obstacles_from_scene();
         initialize_pinocchio();
+        stage_refs_buffer_.resize(static_cast<std::size_t>(nmpc_solver_.getN() + 1));
 
         reference_q_ = Eigen::VectorXd::Zero(7);
         // reference_q_ << 0.0, -1.57, 0.785, -2.356, 0.0, 1.571, 0.785;

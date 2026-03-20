@@ -59,8 +59,8 @@ nmpc_tau_node:
 
       soft_constraint:
         stage:
-          slack_linear: 10000.0
-          slack_quadratic: 1000000.0
+          slack_linear: 100.0
+          slack_quadratic: 10000.0
         terminal:
-          slack_linear: 10000.0
-          slack_quadratic: 1000000.0
+          slack_linear: 100.0
+          slack_quadratic: 10000.0
