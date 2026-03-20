@@ -64,6 +64,8 @@ public:
     scene_xml_path_ = declare_parameter<std::string>(
         "scene_xml_path", "/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml");
     scene_world_frame_ = declare_parameter<std::string>("scene_world_frame", "world");
+    // 对 MoveIt 规划场景里的球障碍做额外半径膨胀，给规划留出安全余量。
+    obstacle_radius_padding_ = declare_parameter<double>("obstacle_radius_padding", 0.0);
 
     use_exact_ik_joint_targets_ = declare_parameter<bool>("use_exact_ik_joint_targets", true);
     ik_seed_attempts_ = declare_parameter<int>("ik_seed_attempts", 80);
@@ -102,10 +104,10 @@ public:
 
     RCLCPP_INFO(
         get_logger(),
-        "Global planner node created. planning_group=%s, target_topic=%s, trajectory_topic=%s, collision_object_topic=%s, service=%s, obstacle_config=%s, scene_xml=%s",
+        "Global planner node created. planning_group=%s, target_topic=%s, trajectory_topic=%s, collision_object_topic=%s, service=%s, obstacle_config=%s, scene_xml=%s, obstacle_radius_padding=%.4f",
         planning_group_.c_str(), target_topic_.c_str(), trajectory_topic_.c_str(),
         collision_object_topic_.c_str(), plan_service_name_.c_str(),
-        obstacle_config_path_.c_str(), scene_xml_path_.c_str());
+        obstacle_config_path_.c_str(), scene_xml_path_.c_str(), obstacle_radius_padding_);
   }
 
 private:
@@ -384,14 +386,15 @@ private:
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
     collision_objects.reserve(obstacles.size());
     for (const auto& obstacle : obstacles) {
-      collision_objects.push_back(panda_moveit::toCollisionObject(obstacle, scene_world_frame_));
+      collision_objects.push_back(
+          panda_moveit::toCollisionObject(obstacle, scene_world_frame_, obstacle_radius_padding_));
     }
     planning_scene_interface_->applyCollisionObjects(collision_objects);
 
     RCLCPP_INFO(
         get_logger(),
-        "Applied %zu static sphere obstacles from '%s'.",
-        collision_objects.size(), obstacle_source_path.c_str());
+        "Applied %zu static sphere obstacles from '%s' with radius padding %.4f m.",
+        collision_objects.size(), obstacle_source_path.c_str(), obstacle_radius_padding_);
   }
 
   void onTargetPose(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -749,6 +752,7 @@ private:
   std::string obstacle_config_path_;
   std::string scene_xml_path_;
   std::string scene_world_frame_;
+  double obstacle_radius_padding_{0.0};
 
   bool moveit_ready_{false};
   bool plan_on_target_update_{false};

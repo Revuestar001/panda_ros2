@@ -109,6 +109,8 @@ Eigen::Vector<double, T> pinoSolver::cSpaceImpedanceControlSolver(const Eigen::V
     Eigen::Matrix<double, T, T> K_d = Eigen::Matrix<double, T, T>::Zero();
     C_d = M_arm * desire_joints_damp;
     K_d = M_arm * desire_joints_stiff;
+    // C_d = Eigen::Matrix<double, T, T>::Identity() * desire_joints_damp;
+    // K_d = Eigen::Matrix<double, T, T>::Identity() * desire_joints_stiff;
 
     Eigen::Vector<double, T> jq_err = target_jq - jq_curr;
     Eigen::Vector<double, T> jv_err = target_jv - jv_curr;

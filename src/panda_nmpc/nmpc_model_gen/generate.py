@@ -131,7 +131,7 @@ class RobotSphere:
 @dataclass
 class OcpConfig:
     dt: float = 0.02
-    horizon_steps: int = 50
+    horizon_steps: int = 20
     solver_name: str = "panda_task_space_nmpc"
     json_file: str = "panda_task_space_nmpc.json"
     code_export_dir: str = "c_generated_code"
@@ -525,7 +525,7 @@ def main() -> None:
     )
     parser.add_argument("--ee-frame", type=str, default="ee_center_body", help="末端 frame 名")
     parser.add_argument("--dt", type=float, default=0.02, help="采样时间")
-    parser.add_argument("--N", type=int, default=50, help="预测步数")
+    parser.add_argument("--N", type=int, default=20, help="预测步数")
     parser.add_argument("--solver-name", type=str, default="panda_task_space_nmpc", help="solver 名称")
     parser.add_argument("--json-file", type=str, default="panda_task_space_nmpc.json", help="json 文件名")
     parser.add_argument("--code-export-dir", type=str, default="c_generated_code", help="C 代码导出目录")

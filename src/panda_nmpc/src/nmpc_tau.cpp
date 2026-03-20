@@ -55,6 +55,7 @@ private:
 
     Eigen::Vector3d target_pos_;
     Eigen::Matrix3d target_rot_;
+    Eigen::VectorXd initial_q_;
     Eigen::VectorXd reference_q_;
     Eigen::VectorXd jq_;
     Eigen::VectorXd jv_;
@@ -660,7 +661,7 @@ private:
             res = nmpc_solver_.NMPCSolve(
                 filtered_target_pos,
                 filtered_target_rot,
-                q_nom,     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
+                reference_q_.head<7>(),     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
                 sorr_pos_.getLinearVelocity(),
                 sorr_rot_.getAngularVelocity(),
                 runtime_obstacle_params_,
@@ -804,9 +805,11 @@ public:
         initialize_pinocchio();
         stage_refs_buffer_.resize(static_cast<std::size_t>(nmpc_solver_.getN() + 1));
 
+        initial_q_ = Eigen::VectorXd::Zero(7);
         reference_q_ = Eigen::VectorXd::Zero(7);
         // reference_q_ << 0.0, -1.57, 0.785, -2.356, 0.0, 1.571, 0.785;
-        reference_q_ << 0.008, -1.382, -0.008, -3.072, -0.007, 1.615, 0.792;
+        initial_q_ << 0.008, -1.382, -0.008, -3.072, -0.007, 1.615, 0.792;
+        reference_q_ << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
         jq_ = Eigen::VectorXd::Zero(7);
         jv_ = Eigen::VectorXd::Zero(7);
 

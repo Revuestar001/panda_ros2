@@ -1,6 +1,7 @@
 #ifndef PANDA_MOVEIT_STATIC_SPHERE_SCENE_HPP_
 #define PANDA_MOVEIT_STATIC_SPHERE_SCENE_HPP_
 
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -130,7 +131,8 @@ inline std::vector<StaticSphereObstacle> loadStaticSphereObstaclesFromSceneXml(
 
 inline moveit_msgs::msg::CollisionObject toCollisionObject(
     const StaticSphereObstacle& obstacle,
-    const std::string& world_frame) {
+    const std::string& world_frame,
+    double radius_padding = 0.0) {
   moveit_msgs::msg::CollisionObject object;
   object.header.frame_id = world_frame;
   object.id = obstacle.name;
@@ -138,7 +140,7 @@ inline moveit_msgs::msg::CollisionObject toCollisionObject(
 
   shape_msgs::msg::SolidPrimitive primitive;
   primitive.type = shape_msgs::msg::SolidPrimitive::SPHERE;
-  primitive.dimensions = {obstacle.radius};
+  primitive.dimensions = {std::max(0.0, obstacle.radius + radius_padding)};
 
   geometry_msgs::msg::Pose pose;
   pose.position.x = obstacle.x;

@@ -33,6 +33,7 @@ def generate_launch_description():
     launch_static_obstacles = LaunchConfiguration("launch_static_obstacles")
     load_static_obstacles_from_scene = LaunchConfiguration("load_static_obstacles_from_scene")
     obstacle_config_path = LaunchConfiguration("obstacle_config_path")
+    obstacle_radius_padding = LaunchConfiguration("obstacle_radius_padding")
     scene_xml_path = LaunchConfiguration("scene_xml_path")
     scene_world_frame = LaunchConfiguration("scene_world_frame")
 
@@ -84,6 +85,7 @@ def generate_launch_description():
                     load_static_obstacles_from_scene, value_type=bool
                 ),
                 "obstacle_config_path": ParameterValue(obstacle_config_path, value_type=str),
+                "obstacle_radius_padding": ParameterValue(obstacle_radius_padding, value_type=float),
                 "scene_xml_path": ParameterValue(scene_xml_path, value_type=str),
                 "scene_world_frame": ParameterValue(scene_world_frame, value_type=str),
             }
@@ -98,6 +100,7 @@ def generate_launch_description():
             {
                 "use_sim_time": True,
                 "obstacle_config_path": ParameterValue(obstacle_config_path, value_type=str),
+                "obstacle_radius_padding": ParameterValue(obstacle_radius_padding, value_type=float),
                 "scene_xml_path": ParameterValue(scene_xml_path, value_type=str),
                 "world_frame": ParameterValue(scene_world_frame, value_type=str),
             }
@@ -115,6 +118,7 @@ def generate_launch_description():
                 "obstacle_config_path",
                 default_value="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
             ),
+            DeclareLaunchArgument("obstacle_radius_padding", default_value="0.02"),
             DeclareLaunchArgument(
                 "scene_xml_path",
                 default_value="/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml",

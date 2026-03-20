@@ -23,17 +23,17 @@ nmpc_tau_node:
     use_global_trajectory: false
 
     ee_frame_pos_tolerance: 0.001
-    ee_frame_rot_tolerance: 0.1
+    ee_frame_rot_tolerance: 0.01
     ee_frame_lin_vel_tolerance: 0.02
     ee_frame_ang_vel_tolerance: 0.1
 
     sorr_pos_damping_ratio: 1.0
-    sorr_pos_natural_frequency: 10.0
+    sorr_pos_natural_frequency: 5.0
     sorr_pos_max_linear_velocity: 1.0
     sorr_pos_max_linear_acceleration: 10.0
 
     sorr_rot_damping_ratio: 1.0
-    sorr_rot_natural_frequency: 10.0
+    sorr_rot_natural_frequency: 5.0
     sorr_rot_max_angular_velocity: 0.7845
     sorr_rot_max_angular_acceleration: 0.7845
 
@@ -41,26 +41,26 @@ nmpc_tau_node:
 
     nmpc_weights:
       stage:
-        pos: [2500.0, 2500.0, 2500.0]
-        rot: [100.0, 100.0, 100.0]
-        ee_lin_vel: [5.0, 5.0, 5.0]
-        ee_ang_vel: [2.0, 2.0, 2.0]
-        q_reg: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+        pos: [250.0, 250.0, 250.0]
+        rot: [10.0, 10.0, 10.0]
+        ee_lin_vel: [0.0, 0.0, 0.0]
+        ee_ang_vel: [0.0, 0.0, 0.0]
+        q_reg: [0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]
         dq_reg: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
         ddq_reg: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
 
       terminal:
         pos: [4000.0, 4000.0, 4000.0]
-        rot: [200.0, 200.0, 200.0]
-        ee_lin_vel: [10.0, 10.0, 10.0]
-        ee_ang_vel: [4.0, 4.0, 4.0]
-        q_reg: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-        dq_reg: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+        rot: [2000.0, 2000.0, 2000.0]
+        ee_lin_vel: [0.0, 0.0, 0.0]
+        ee_ang_vel: [0.0, 0.0, 0.0]
+        q_reg: [0.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0]
+        dq_reg: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
 
       soft_constraint:
         stage:
-          slack_linear: 100.0
-          slack_quadratic: 10000.0
+          slack_linear: 10000.0
+          slack_quadratic: 1000000.0
         terminal:
-          slack_linear: 100.0
-          slack_quadratic: 10000.0
+          slack_linear: 10000.0
+          slack_quadratic: 1000000.0

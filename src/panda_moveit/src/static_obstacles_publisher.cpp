@@ -21,6 +21,7 @@ public:
         "/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml");
     scene_xml_path_ = declare_parameter<std::string>(
         "scene_xml_path", "/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml");
+    obstacle_radius_padding_ = declare_parameter<double>("obstacle_radius_padding", 0.0);
 
     collision_object_pub_ = create_publisher<moveit_msgs::msg::CollisionObject>(
         collision_object_topic_, rclcpp::QoS(10).reliable().transient_local());
@@ -30,9 +31,9 @@ public:
 
     RCLCPP_INFO(
         get_logger(),
-        "Static obstacles publisher created. topic=%s, frame=%s, obstacle_config=%s, scene_xml=%s",
+        "Static obstacles publisher created. topic=%s, frame=%s, obstacle_config=%s, scene_xml=%s, obstacle_radius_padding=%.4f",
         collision_object_topic_.c_str(), world_frame_.c_str(),
-        obstacle_config_path_.c_str(), scene_xml_path_.c_str());
+        obstacle_config_path_.c_str(), scene_xml_path_.c_str(), obstacle_radius_padding_);
   }
 
 private:
@@ -61,13 +62,15 @@ private:
     }
 
     for (const auto& obstacle : obstacles) {
-      auto object = panda_moveit::toCollisionObject(obstacle, world_frame_);
+      auto object = panda_moveit::toCollisionObject(
+          obstacle, world_frame_, obstacle_radius_padding_);
       object.header.stamp = now();
       collision_object_pub_->publish(object);
       RCLCPP_INFO(
           get_logger(),
-          "Published static obstacle '%s' from '%s' in frame '%s'.",
-          object.id.c_str(), obstacle_source_path.c_str(), object.header.frame_id.c_str());
+          "Published static obstacle '%s' from '%s' in frame '%s' with radius padding %.4f m.",
+          object.id.c_str(), obstacle_source_path.c_str(), object.header.frame_id.c_str(),
+          obstacle_radius_padding_);
     }
 
     // QoS 使用 transient_local，发布一次后保留样本供晚加入订阅者获取。
@@ -81,6 +84,7 @@ private:
   std::string world_frame_;
   std::string obstacle_config_path_;
   std::string scene_xml_path_;
+  double obstacle_radius_padding_{0.0};
   int publish_delay_ms_{500};
 };
 
