@@ -394,12 +394,15 @@ def build_acados_ocp(urdf_path: str, obstacle_source_path: str, ee_frame_name: s
     model.cost_y_expr = cost_y
     model.cost_y_expr_e = cost_y_e
 
-    h_expr_list: list[ca.SX] = []
-    for sphere in robot_spheres:
+    def sphere_center_world_expr(sphere: RobotSphere) -> ca.SX:
         sphere_frame_id = resolve_frame_id(pin_model, sphere.frame_name)
         T_w_link = cdata.oMf[sphere_frame_id]
         offset_local = ca.DM(np.asarray(sphere.offset_xyz, dtype=float)).reshape((3, 1))
-        sphere_center_world = T_w_link.translation + T_w_link.rotation @ offset_local
+        return T_w_link.translation + T_w_link.rotation @ offset_local
+
+    h_expr_list: list[ca.SX] = []
+    for sphere in robot_spheres:
+        sphere_center_world = sphere_center_world_expr(sphere)
 
         for obs_center, obs_radius in obstacle_list:
             min_allowed_dist = sphere.radius + obs_radius + cfg.obstacle.safety_margin
@@ -548,6 +551,7 @@ def main() -> None:
 
     robot_spheres = load_robot_spheres_from_urdf(args.urdf)
     ocp = build_acados_ocp(args.urdf, args.obstacle_config, args.ee_frame, cfg)
+    obstacle_constraint_count = len(robot_spheres) * cfg.obstacle.num_obstacles
 
     print("开始生成 Panda 任务空间位姿跟踪 NMPC 的 acados C 代码...")
     print(f"URDF: {args.urdf}")
@@ -567,7 +571,7 @@ def main() -> None:
         f" + q_reg(7) + dq_reg(7) + ddq_reg(7)"
     )
     print(
-        f"避障约束数量 nh = {len(robot_spheres) * cfg.obstacle.num_obstacles}"
+        f"避障约束数量 nh = {obstacle_constraint_count}"
         f" = robot_spheres({len(robot_spheres)}) * obstacles({cfg.obstacle.num_obstacles})"
     )
 
