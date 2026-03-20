@@ -1,0 +1,7 @@
+<static_sphere_obstacles>
+  <!-- Canonical static sphere obstacle source.
+       Edit this file and the launch/codegen sync path will propagate changes
+       to scene_tau_ros.xml, MoveIt obstacle loading, and acados obstacle loading. -->
+  <obstacle name="obs1" pos="0.4 -0.5 0.35" radius="0.1" rgba="1 0 0 1"/>
+  <obstacle name="obs2" pos="0.4 0.1 0.35" radius="0.1" rgba="0 1 0 1"/>
+</static_sphere_obstacles>

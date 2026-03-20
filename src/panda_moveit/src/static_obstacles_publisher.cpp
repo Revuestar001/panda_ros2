@@ -3,10 +3,10 @@
 #include <string>
 #include <vector>
 
-#include <geometry_msgs/msg/pose.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <shape_msgs/msg/solid_primitive.hpp>
+
+#include "panda_moveit/static_sphere_scene.hpp"
 
 class StaticObstaclesPublisherNode : public rclcpp::Node {
 public:
@@ -16,19 +16,11 @@ public:
         declare_parameter<std::string>("collision_object_topic", "/global_collision_object");
     world_frame_ = declare_parameter<std::string>("world_frame", "world");
     publish_delay_ms_ = declare_parameter<int>("publish_delay_ms", 500);
-
-    // 默认与 panda_nmpc_controller.hpp 中当前写死的两个球一致。
-    obstacle_1_enabled_ = declare_parameter<bool>("obstacle_1.enabled", true);
-    obstacle_1_x_ = declare_parameter<double>("obstacle_1.x", 0.4);
-    obstacle_1_y_ = declare_parameter<double>("obstacle_1.y", -0.1);
-    obstacle_1_z_ = declare_parameter<double>("obstacle_1.z", 0.35);
-    obstacle_1_radius_ = declare_parameter<double>("obstacle_1.radius", 0.1);
-
-    obstacle_2_enabled_ = declare_parameter<bool>("obstacle_2.enabled", true);
-    obstacle_2_x_ = declare_parameter<double>("obstacle_2.x", 0.4);
-    obstacle_2_y_ = declare_parameter<double>("obstacle_2.y", 0.1);
-    obstacle_2_z_ = declare_parameter<double>("obstacle_2.z", 0.35);
-    obstacle_2_radius_ = declare_parameter<double>("obstacle_2.radius", 0.1);
+    obstacle_config_path_ = declare_parameter<std::string>(
+        "obstacle_config_path",
+        "/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml");
+    scene_xml_path_ = declare_parameter<std::string>(
+        "scene_xml_path", "/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml");
 
     collision_object_pub_ = create_publisher<moveit_msgs::msg::CollisionObject>(
         collision_object_topic_, rclcpp::QoS(10).reliable().transient_local());
@@ -38,58 +30,44 @@ public:
 
     RCLCPP_INFO(
         get_logger(),
-        "Static obstacles publisher created. topic=%s, frame=%s",
-        collision_object_topic_.c_str(), world_frame_.c_str());
+        "Static obstacles publisher created. topic=%s, frame=%s, obstacle_config=%s, scene_xml=%s",
+        collision_object_topic_.c_str(), world_frame_.c_str(),
+        obstacle_config_path_.c_str(), scene_xml_path_.c_str());
   }
 
 private:
-  moveit_msgs::msg::CollisionObject makeSphereObstacle(
-      const std::string& id, double x, double y, double z, double radius) const {
-    moveit_msgs::msg::CollisionObject object;
-    object.header.stamp = now();
-    object.header.frame_id = world_frame_;
-    object.id = id;
-    object.operation = moveit_msgs::msg::CollisionObject::ADD;
-
-    shape_msgs::msg::SolidPrimitive primitive;
-    primitive.type = shape_msgs::msg::SolidPrimitive::SPHERE;
-    primitive.dimensions = {radius};
-
-    geometry_msgs::msg::Pose pose;
-    pose.position.x = x;
-    pose.position.y = y;
-    pose.position.z = z;
-    pose.orientation.w = 1.0;
-
-    object.primitives.push_back(primitive);
-    object.primitive_poses.push_back(pose);
-    return object;
-  }
-
   void publishObstacles() {
-    std::vector<moveit_msgs::msg::CollisionObject> objects;
-
-    if (obstacle_1_enabled_) {
-      objects.push_back(
-          makeSphereObstacle("obs_sphere_1", obstacle_1_x_, obstacle_1_y_, obstacle_1_z_, obstacle_1_radius_));
-    }
-    if (obstacle_2_enabled_) {
-      objects.push_back(
-          makeSphereObstacle("obs_sphere_2", obstacle_2_x_, obstacle_2_y_, obstacle_2_z_, obstacle_2_radius_));
-    }
-
-    if (objects.empty()) {
-      RCLCPP_WARN(get_logger(), "No enabled static obstacles configured. Nothing will be published.");
+    const std::string obstacle_source_path =
+        obstacle_config_path_.empty() ? scene_xml_path_ : obstacle_config_path_;
+    std::vector<panda_moveit::StaticSphereObstacle> obstacles;
+    try {
+      obstacles = panda_moveit::loadStaticSphereObstaclesFromSceneXml(obstacle_source_path);
+    } catch (const std::exception& ex) {
+      RCLCPP_ERROR(
+          get_logger(),
+          "Failed to load static sphere obstacles from '%s': %s",
+          obstacle_source_path.c_str(), ex.what());
       publish_timer_->cancel();
       return;
     }
 
-    for (const auto& object : objects) {
+    if (obstacles.empty()) {
+      RCLCPP_WARN(
+          get_logger(),
+          "Obstacle source '%s' does not contain any static sphere obstacles. Nothing will be published.",
+          obstacle_source_path.c_str());
+      publish_timer_->cancel();
+      return;
+    }
+
+    for (const auto& obstacle : obstacles) {
+      auto object = panda_moveit::toCollisionObject(obstacle, world_frame_);
+      object.header.stamp = now();
       collision_object_pub_->publish(object);
       RCLCPP_INFO(
           get_logger(),
-          "Published static obstacle '%s' in frame '%s'.",
-          object.id.c_str(), object.header.frame_id.c_str());
+          "Published static obstacle '%s' from '%s' in frame '%s'.",
+          object.id.c_str(), obstacle_source_path.c_str(), object.header.frame_id.c_str());
     }
 
     // QoS 使用 transient_local，发布一次后保留样本供晚加入订阅者获取。
@@ -101,19 +79,9 @@ private:
 
   std::string collision_object_topic_;
   std::string world_frame_;
+  std::string obstacle_config_path_;
+  std::string scene_xml_path_;
   int publish_delay_ms_{500};
-
-  bool obstacle_1_enabled_{true};
-  double obstacle_1_x_{0.4};
-  double obstacle_1_y_{-0.1};
-  double obstacle_1_z_{0.35};
-  double obstacle_1_radius_{0.1};
-
-  bool obstacle_2_enabled_{true};
-  double obstacle_2_x_{0.4};
-  double obstacle_2_y_{0.1};
-  double obstacle_2_z_{0.35};
-  double obstacle_2_radius_{0.1};
 };
 
 int main(int argc, char** argv) {

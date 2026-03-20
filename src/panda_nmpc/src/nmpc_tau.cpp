@@ -21,6 +21,7 @@
 
 #include "panda_interfaces/msg/result_nmpc.hpp"
 #include "panda_nmpc_controller.hpp"
+#include "static_sphere_scene.hpp"
 #include "second_order_reference_regulator.hpp"
 
 class NMPCNode : public rclcpp::Node {
@@ -28,6 +29,8 @@ private:
     using Vec7 = Eigen::Matrix<double, 7, 1>;
     using Vec3 = Eigen::Vector3d;
     using Mat3 = Eigen::Matrix3d;
+    using ObstacleParamBlock = PandaNMPCController::ObstacleParamBlock;
+    using CostWeights = PandaNMPCController::CostWeights;
 
     struct TaskSpacePathSample {
         double path_s{0.0};
@@ -57,6 +60,8 @@ private:
     Eigen::VectorXd jv_;
 
     std::string urdf_path_;
+    std::string obstacle_config_path_;
+    std::string scene_xml_path_;
     std::string ee_frame_name_;
     std::string joint_states_topic_;
     std::string joint_trajectory_topic_;
@@ -99,6 +104,9 @@ private:
     pinocchio::Model pin_model_;
     std::unique_ptr<pinocchio::Data> pin_data_;
     pinocchio::FrameIndex ee_frame_id_{0};
+    std::vector<panda_nmpc::StaticSphereObstacle> scene_obstacles_;
+    ObstacleParamBlock runtime_obstacle_params_{PandaNMPCController::disabledObstacleParams()};
+    CostWeights nmpc_cost_weights_{PandaNMPCController::defaultCostWeights()};
 
     // topic & timer
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
@@ -119,8 +127,74 @@ private:
         }
     }
 
+    static std::string default_scene_xml_path() {
+        return "/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml";
+    }
+
+    static std::string default_obstacle_config_path() {
+        return "/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml";
+    }
+
+    template <std::size_t N>
+    static std::vector<double> to_parameter_vector(const std::array<double, N>& values) {
+        return std::vector<double>(values.begin(), values.end());
+    }
+
+    template <std::size_t N>
+    std::array<double, N> declare_fixed_size_array_parameter(
+        const std::string& param_name,
+        const std::array<double, N>& defaults) {
+        const auto raw_values =
+            this->declare_parameter<std::vector<double>>(param_name, to_parameter_vector(defaults));
+        if (raw_values.size() != N) {
+            throw std::runtime_error(
+                "Parameter '" + param_name + "' must contain exactly " + std::to_string(N) + " values.");
+        }
+
+        std::array<double, N> values{};
+        std::copy(raw_values.begin(), raw_values.end(), values.begin());
+        return values;
+    }
+
+    void load_static_obstacles_from_scene() {
+        runtime_obstacle_params_ = PandaNMPCController::disabledObstacleParams();
+        const std::string obstacle_source_path =
+            obstacle_config_path_.empty() ? scene_xml_path_ : obstacle_config_path_;
+        scene_obstacles_ = panda_nmpc::loadStaticSphereObstaclesFromSceneXml(obstacle_source_path);
+
+        if (scene_obstacles_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "No static sphere obstacles found in '%s'. NMPC obstacle constraints are disabled.",
+                obstacle_source_path.c_str());
+            return;
+        }
+
+        if (scene_obstacles_.size() > PandaNMPCController::kNumRuntimeObstacles) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Obstacle config defines %zu sphere obstacles but solver only supports %zu. Extra obstacles will be ignored until acados is regenerated.",
+                scene_obstacles_.size(),
+                PandaNMPCController::kNumRuntimeObstacles);
+        }
+
+        const std::size_t obstacle_count =
+            std::min(scene_obstacles_.size(), PandaNMPCController::kNumRuntimeObstacles);
+        for (std::size_t obstacle_idx = 0; obstacle_idx < obstacle_count; ++obstacle_idx) {
+            const std::size_t offset = obstacle_idx * 4;
+            const auto& obstacle = scene_obstacles_[obstacle_idx];
+            runtime_obstacle_params_[offset + 0] = obstacle.center.x();
+            runtime_obstacle_params_[offset + 1] = obstacle.center.y();
+            runtime_obstacle_params_[offset + 2] = obstacle.center.z();
+            runtime_obstacle_params_[offset + 3] = obstacle.radius;
+        }
+    }
+
     void declare_startup_parameters() {
         urdf_path_ = this->declare_parameter<std::string>("urdf_path", default_panda_urdf_path());
+        obstacle_config_path_ =
+            this->declare_parameter<std::string>("obstacle_config_path", default_obstacle_config_path());
+        scene_xml_path_ = this->declare_parameter<std::string>("scene_xml_path", default_scene_xml_path());
         ee_frame_name_ = this->declare_parameter<std::string>("ee_frame_name", "ee_center_body");
 
         joint_states_topic_ = this->declare_parameter<std::string>("joint_states_topic", "/joint_states");
@@ -160,6 +234,51 @@ private:
             this->declare_parameter<double>("sorr_rot_max_angular_velocity", 0.7845);
         sorr_rot_max_angular_acceleration_ =
             this->declare_parameter<double>("sorr_rot_max_angular_acceleration", 0.7845);
+
+        const CostWeights default_cost_weights = PandaNMPCController::defaultCostWeights();
+        nmpc_cost_weights_.pos = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.pos", default_cost_weights.pos);
+        nmpc_cost_weights_.rot = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.rot", default_cost_weights.rot);
+        nmpc_cost_weights_.ee_lin_vel = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.ee_lin_vel", default_cost_weights.ee_lin_vel);
+        nmpc_cost_weights_.ee_ang_vel = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.ee_ang_vel", default_cost_weights.ee_ang_vel);
+        nmpc_cost_weights_.q_reg = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.q_reg", default_cost_weights.q_reg);
+        nmpc_cost_weights_.dq_reg = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.dq_reg", default_cost_weights.dq_reg);
+        nmpc_cost_weights_.ddq_reg = declare_fixed_size_array_parameter(
+            "nmpc_weights.stage.ddq_reg", default_cost_weights.ddq_reg);
+
+        nmpc_cost_weights_.pos_e = declare_fixed_size_array_parameter(
+            "nmpc_weights.terminal.pos", default_cost_weights.pos_e);
+        nmpc_cost_weights_.rot_e = declare_fixed_size_array_parameter(
+            "nmpc_weights.terminal.rot", default_cost_weights.rot_e);
+        nmpc_cost_weights_.ee_lin_vel_e = declare_fixed_size_array_parameter(
+            "nmpc_weights.terminal.ee_lin_vel", default_cost_weights.ee_lin_vel_e);
+        nmpc_cost_weights_.ee_ang_vel_e = declare_fixed_size_array_parameter(
+            "nmpc_weights.terminal.ee_ang_vel", default_cost_weights.ee_ang_vel_e);
+        nmpc_cost_weights_.q_reg_e = declare_fixed_size_array_parameter(
+            "nmpc_weights.terminal.q_reg", default_cost_weights.q_reg_e);
+        nmpc_cost_weights_.dq_reg_e = declare_fixed_size_array_parameter(
+            "nmpc_weights.terminal.dq_reg", default_cost_weights.dq_reg_e);
+        nmpc_cost_weights_.soft_constraint_stage.slack_linear =
+            this->declare_parameter<double>(
+                "nmpc_weights.soft_constraint.stage.slack_linear",
+                default_cost_weights.soft_constraint_stage.slack_linear);
+        nmpc_cost_weights_.soft_constraint_stage.slack_quadratic =
+            this->declare_parameter<double>(
+                "nmpc_weights.soft_constraint.stage.slack_quadratic",
+                default_cost_weights.soft_constraint_stage.slack_quadratic);
+        nmpc_cost_weights_.soft_constraint_terminal.slack_linear =
+            this->declare_parameter<double>(
+                "nmpc_weights.soft_constraint.terminal.slack_linear",
+                default_cost_weights.soft_constraint_terminal.slack_linear);
+        nmpc_cost_weights_.soft_constraint_terminal.slack_quadratic =
+            this->declare_parameter<double>(
+                "nmpc_weights.soft_constraint.terminal.slack_quadratic",
+                default_cost_weights.soft_constraint_terminal.slack_quadratic);
 
         // [修改] 用路径弧长而不是 time_from_start 推 horizon 参考。
         trajectory_path_stage_spacing_ =
@@ -392,6 +511,7 @@ private:
             stage_ref.q_nom = current_q;  // [修改] 终端保持不再被 MoveIt goal q 或 ready pose 额外拉扯。
             stage_ref.ee_lin_vel_ref.setZero();
             stage_ref.ee_ang_vel_ref.setZero();
+            stage_ref.obstacle_params = runtime_obstacle_params_;
         }
 
         return stage_refs;
@@ -400,7 +520,7 @@ private:
     // [修改] 用“路径进度 + 前视距离”生成整条 horizon 参考。
     std::vector<NMPCStageReference> build_path_progress_stage_refs(
         const Vec7& current_q,
-        const Vec7& current_v) {
+        const Vec7& /*current_v*/) {
         const int N = nmpc_solver_.getN();
         std::vector<NMPCStageReference> stage_refs(static_cast<std::size_t>(N + 1));
 
@@ -415,6 +535,7 @@ private:
                 stage_ref.q_nom = current_q;
                 stage_ref.ee_lin_vel_ref.setZero();
                 stage_ref.ee_ang_vel_ref.setZero();
+                stage_ref.obstacle_params = runtime_obstacle_params_;
             }
             return stage_refs;
         }
@@ -441,6 +562,7 @@ private:
             // [修改] 当前阶段先不给绝对时间意义上的末端速度参考，避免重新把 NMPC 拉回 time tracking。
             stage_ref.ee_lin_vel_ref.setZero();
             stage_ref.ee_ang_vel_ref.setZero();
+            stage_ref.obstacle_params = runtime_obstacle_params_;
         }
 
         // [修改] 强制把 terminal stage 锚定到手动设置/外部订阅得到的最终目标位姿。
@@ -455,6 +577,7 @@ private:
         terminal_ref.q_nom = current_q;
         terminal_ref.ee_lin_vel_ref.setZero();
         terminal_ref.ee_ang_vel_ref.setZero();
+        terminal_ref.obstacle_params = runtime_obstacle_params_;
 
         return stage_refs;
     }
@@ -523,6 +646,7 @@ private:
                 q_nom,     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
                 sorr_pos_.getLinearVelocity(),
                 sorr_rot_.getAngularVelocity(),
+                runtime_obstacle_params_,
                 current_q,
                 current_v
             );
@@ -658,6 +782,8 @@ private:
 public:
     NMPCNode() : Node("nmpc_tau_node") {
         declare_startup_parameters();
+        nmpc_solver_.setCostWeights(nmpc_cost_weights_);
+        load_static_obstacles_from_scene();
         initialize_pinocchio();
 
         reference_q_ = Eigen::VectorXd::Zero(7);
@@ -694,8 +820,11 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "NMPC node configured. use_global_trajectory=%s, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, target_pose_topic=%s, result_topic=%s",
+            "NMPC node configured. use_global_trajectory=%s, obstacle_config=%s, scene_xml=%s, loaded_sphere_obstacles=%zu, urdf=%s, ee_frame=%s, joint_states_topic=%s, joint_trajectory_topic=%s, target_pose_topic=%s, result_topic=%s",
             use_global_trajectory_ ? "true" : "false",
+            obstacle_config_path_.c_str(),
+            scene_xml_path_.c_str(),
+            scene_obstacles_.size(),
             urdf_path_.c_str(),
             ee_frame_name_.c_str(),
             joint_states_topic_.c_str(),

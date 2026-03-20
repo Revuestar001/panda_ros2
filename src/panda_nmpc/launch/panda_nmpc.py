@@ -38,7 +38,9 @@ Usage:
 """
 
 import os
+import subprocess
 
+from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
 from launch.substitutions import (
@@ -54,6 +56,26 @@ from launch_ros.substitutions import FindPackageShare
 
 def launch_setup(context, *args, **kwargs):
     pkg_share = FindPackageShare("panda_ros")
+    nmpc_share = FindPackageShare("panda_nmpc")
+
+    obstacle_config_path = LaunchConfiguration("obstacle_config_path").perform(context)
+    scene_xml_path = LaunchConfiguration("scene_xml_path").perform(context)
+    sync_executable = os.path.join(
+        get_package_prefix("panda_nmpc"),
+        "lib",
+        "panda_nmpc",
+        "sync_static_sphere_scene.py",
+    )
+    subprocess.run(
+        [
+            sync_executable,
+            "--obstacle-config",
+            obstacle_config_path,
+            "--scene-xml",
+            scene_xml_path,
+        ],
+        check=True,
+    )
 
     # Build robot description with PID control enabled
     # This uses demo_resources/scenes/scene_pid.xml which includes the PID robot model
@@ -73,6 +95,7 @@ def launch_setup(context, *args, **kwargs):
     robot_description = {"robot_description": ParameterValue(value=robot_description_str, value_type=str)}
 
     parameters_file = PathJoinSubstitution([pkg_share, "config", "pinoController.yaml"])
+    nmpc_params_file = LaunchConfiguration("nmpc_params_file")
 
     nodes = []
 
@@ -91,6 +114,13 @@ def launch_setup(context, *args, **kwargs):
             package="panda_nmpc",
             executable="nmpc_tau",
             output="both",
+            parameters=[
+                ParameterFile(nmpc_params_file, allow_substs=True),
+                {
+                    "obstacle_config_path": obstacle_config_path,
+                    "scene_xml_path": scene_xml_path,
+                },
+            ],
             # on_exit=Shutdown(),
         )
     )
@@ -144,10 +174,28 @@ def generate_launch_description():
         default_value="false",
         description="Run simulation without visualization window",
     )
+    nmpc_params_file = DeclareLaunchArgument(
+        "nmpc_params_file",
+        default_value=PathJoinSubstitution([FindPackageShare("panda_nmpc"), "config", "nmpc_tau.yaml"]),
+        description="Parameter file that provides all runtime NMPC settings",
+    )
+    obstacle_config_path = DeclareLaunchArgument(
+        "obstacle_config_path",
+        default_value="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
+        description="Canonical static sphere obstacle config shared by MuJoCo, MoveIt and acados",
+    )
+    scene_xml_path = DeclareLaunchArgument(
+        "scene_xml_path",
+        default_value="/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml",
+        description="MuJoCo scene XML that will be synchronized before startup",
+    )
 
     return LaunchDescription(
         [
             headless,
+            nmpc_params_file,
+            obstacle_config_path,
+            scene_xml_path,
             OpaqueFunction(function=launch_setup),
         ]
     )

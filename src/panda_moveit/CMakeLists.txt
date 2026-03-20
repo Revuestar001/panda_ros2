@@ -13,6 +13,8 @@ find_package(rclcpp REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(shape_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(tinyxml2_vendor REQUIRED)
+find_package(TinyXML2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(trajectory_msgs REQUIRED)
@@ -29,10 +31,12 @@ ament_target_dependencies(
   "rclcpp"
   "moveit_ros_planning_interface"
   "std_srvs"
+  "tinyxml2_vendor"
   "tf2_geometry_msgs"
   "tf2_ros"
   "trajectory_msgs"
 )
+target_link_libraries(global_planning tinyxml2::tinyxml2)
 
 add_executable(goal_commander src/goal_commander.cpp)
 target_include_directories(goal_commander PUBLIC
@@ -57,7 +61,9 @@ ament_target_dependencies(
   "moveit_msgs"
   "rclcpp"
   "shape_msgs"
+  "tinyxml2_vendor"
 )
+target_link_libraries(static_obstacles_publisher tinyxml2::tinyxml2)
 
 install(TARGETS global_planning goal_commander static_obstacles_publisher
   DESTINATION lib/${PROJECT_NAME})

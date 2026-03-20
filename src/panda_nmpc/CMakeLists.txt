@@ -13,6 +13,8 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(tinyxml2_vendor REQUIRED)
+find_package(TinyXML2 REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
 
@@ -46,9 +48,31 @@ find_library(ACADOS_LIB acados PATHS ${ACADOS_DIR}/lib REQUIRED)
 find_library(HPIPM_LIB hpipm PATHS ${ACADOS_DIR}/lib REQUIRED)
 find_library(BLASFEO_LIB blasfeo PATHS ${ACADOS_DIR}/lib REQUIRED)
 
-# 查找你刚刚生成的求解器动态库 (需提前在 c_generated_code 目录下执行 make shared_lib)
-# 注意：库的名字必须和你在 Python 里设定的 acados_model.name 匹配
-find_library(SOLVER_LIB acados_solver_panda_task_space_nmpc PATHS ${GEN_CODE_DIR}/c_generated_code REQUIRED)
+# 直接用当前 workspace 中最新的 generated C 源码构建 solver 共享库，
+# 避免“头文件/生成源码已经更新，但旧的 .so 还没重新 make”导致的参数维度错位。
+file(GLOB_RECURSE GENERATED_C_SOURCES
+  "${GEN_CODE_DIR}/c_generated_code/*.c"
+  "${GEN_CODE_DIR}/c_generated_code/**/*.c")
+list(FILTER GENERATED_C_SOURCES EXCLUDE REGEX "main_.*\\.c$")
+
+add_library(panda_task_space_nmpc_generated_solver SHARED
+  ${GENERATED_C_SOURCES}
+)
+target_include_directories(panda_task_space_nmpc_generated_solver PUBLIC
+  ${ACADOS_INCLUDE_DIRS}
+)
+set_target_properties(panda_task_space_nmpc_generated_solver PROPERTIES
+  C_STANDARD 99
+  C_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+  OUTPUT_NAME acados_solver_panda_task_space_nmpc
+)
+target_link_libraries(panda_task_space_nmpc_generated_solver
+  ${ACADOS_LIB}
+  ${HPIPM_LIB}
+  ${BLASFEO_LIB}
+  m
+)
 
 # ===================================================================
 
@@ -86,6 +110,7 @@ ament_target_dependencies(nmpc_tau
   sensor_msgs
   panda_interfaces
   "trajectory_msgs"
+  "tinyxml2_vendor"
 )
 
 ament_target_dependencies(nmpc_tau_original
@@ -103,16 +128,17 @@ target_link_libraries(nmpc_tau
   ${ACADOS_LIB}
   ${HPIPM_LIB}
   ${BLASFEO_LIB}
-  ${SOLVER_LIB}
+  panda_task_space_nmpc_generated_solver
   Eigen3::Eigen
   pinocchio::pinocchio
+  tinyxml2::tinyxml2
 )
 
 target_link_libraries(nmpc_tau_original
   ${ACADOS_LIB}
   ${HPIPM_LIB}
   ${BLASFEO_LIB}
-  ${SOLVER_LIB}
+  panda_task_space_nmpc_generated_solver
   Eigen3::Eigen
   pinocchio::pinocchio
 )
@@ -133,15 +159,18 @@ set_target_properties(nmpc_tau_original PROPERTIES
 install(TARGETS nmpc_tau nmpc_tau_original
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY
-  launch
-  DESTINATION share/${PROJECT_NAME}
+install(TARGETS panda_task_space_nmpc_generated_solver
+  DESTINATION lib/${PROJECT_NAME}/c_generated_code)
+
+install(PROGRAMS
+  scripts/sync_static_sphere_scene.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
-# 安装自动生成的动态库，确保 ROS 2 install 空间里有 .so 文件可用
-install(DIRECTORY ${GEN_CODE_DIR}/c_generated_code/
-  DESTINATION lib/${PROJECT_NAME}/c_generated_code
-  FILES_MATCHING PATTERN "*.so"
+install(DIRECTORY
+  launch
+  config
+  DESTINATION share/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)

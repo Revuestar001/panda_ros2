@@ -115,7 +115,7 @@ class WeightConfig:
 
 @dataclass
 class ObstacleSoftConstraintConfig:
-    num_obstacles: int = 1
+    num_obstacles: int = 0
     safety_margin: float = 0.03
     slack_linear: float = 1.0e4
     slack_quadratic: float = 1.0e6
@@ -131,7 +131,7 @@ class RobotSphere:
 @dataclass
 class OcpConfig:
     dt: float = 0.02
-    horizon_steps: int = 20
+    horizon_steps: int = 50
     solver_name: str = "panda_task_space_nmpc"
     json_file: str = "panda_task_space_nmpc.json"
     code_export_dir: str = "c_generated_code"
@@ -242,19 +242,77 @@ def load_robot_spheres_from_urdf(urdf_path: str) -> list[RobotSphere]:
     return spheres
 
 
-def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> AcadosOcp:
+def load_static_sphere_obstacles(scene_xml_path: str) -> list[tuple[str, np.ndarray, float]]:
+    tree = ET.parse(scene_xml_path)
+    root = tree.getroot()
+
+    if root.tag == "static_sphere_obstacles":
+        obstacles: list[tuple[str, np.ndarray, float]] = []
+        for obstacle_elem in root.findall("obstacle"):
+            body_name = obstacle_elem.get("name")
+            pos_attr = obstacle_elem.get("pos")
+            radius_attr = obstacle_elem.get("radius")
+            if body_name is None or pos_attr is None or radius_attr is None:
+                raise ValueError(
+                    f"球障碍配置项必须包含 name/pos/radius。文件: {scene_xml_path}"
+                )
+
+            center = _parse_xyz_attr(pos_attr)
+            radius = float(radius_attr)
+            obstacles.append((body_name, center, radius))
+        return obstacles
+
+    worldbody_elem = root.find("worldbody")
+    if worldbody_elem is None:
+        raise ValueError(f"场景文件中未找到 <worldbody>: {scene_xml_path}")
+
+    obstacles: list[tuple[str, np.ndarray, float]] = []
+    for body_elem in worldbody_elem.findall("body"):
+        geom_elem = body_elem.find("geom")
+        if geom_elem is None or geom_elem.get("type") != "sphere":
+            continue
+
+        body_name = body_elem.get("name")
+        pos_attr = body_elem.get("pos")
+        size_attr = geom_elem.get("size")
+        if body_name is None or pos_attr is None or size_attr is None:
+            raise ValueError(
+                f"球障碍 body 必须包含 name/pos，geom 必须包含 size。文件: {scene_xml_path}"
+            )
+
+        center = _parse_xyz_attr(pos_attr)
+        radius = float(size_attr.strip().split()[0])
+        obstacles.append((body_name, center, radius))
+
+    return obstacles
+
+
+def build_acados_ocp(urdf_path: str, obstacle_source_path: str, ee_frame_name: str, cfg: OcpConfig) -> AcadosOcp:
     if not os.path.exists(urdf_path):
         raise FileNotFoundError(f"找不到 URDF 文件: {urdf_path}")
+    if not os.path.exists(obstacle_source_path):
+        raise FileNotFoundError(f"找不到障碍物配置文件: {obstacle_source_path}")
 
     pin_model = pin.buildModelFromUrdf(urdf_path)
     assert_fixed_base_7dof(pin_model)
     ee_frame_id = resolve_frame_id(pin_model, ee_frame_name)
 
     robot_spheres = load_robot_spheres_from_urdf(urdf_path)
+    scene_obstacles = load_static_sphere_obstacles(obstacle_source_path)
     if len(robot_spheres) == 0:
         raise ValueError(
             "在 URDF 中没有解析到任何 <visual><geometry><sphere/></geometry></visual> 球体，"
             "无法构造机械臂避障约束。"
+        )
+    if len(scene_obstacles) == 0:
+        raise ValueError(
+            "在 MuJoCo scene 中没有解析到任何静态球障碍，"
+            "请先在静态球障碍配置中放置至少一个球障碍。"
+        )
+    if cfg.obstacle.num_obstacles != len(scene_obstacles):
+        raise ValueError(
+            "cfg.obstacle.num_obstacles 与障碍物配置中解析到的静态球障碍数量不一致："
+            f"{cfg.obstacle.num_obstacles} != {len(scene_obstacles)}"
         )
     for sphere in robot_spheres:
         _ = resolve_frame_id(pin_model, sphere.frame_name)
@@ -281,7 +339,7 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
 
     obstacle_params_offset = cfg.base_np_stage
     obstacle_list: list[tuple[ca.SX, ca.SX]] = []
-    for obs_idx in range(cfg.obstacle.num_obstacles):
+    for obs_idx, _ in enumerate(scene_obstacles):
         off = obstacle_params_offset + 4 * obs_idx
         obs_center = p[off:off + 3]
         obs_radius = p[off + 3]
@@ -363,10 +421,10 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
     parameter_values[3:12] = np.eye(3, dtype=float).reshape(-1, order="F")
     # 默认末端速度参考为 0，适用于静态目标
     parameter_values[19:25] = 0.0
-    for obs_idx in range(cfg.obstacle.num_obstacles):
+    for obs_idx, (_, obs_center, obs_radius) in enumerate(scene_obstacles):
         off = cfg.base_np_stage + 4 * obs_idx
-        parameter_values[off:off + 3] = np.array([1000.0, 1000.0, 1000.0], dtype=float)
-        parameter_values[off + 3] = 0.0
+        parameter_values[off:off + 3] = obs_center
+        parameter_values[off + 3] = obs_radius
     ocp.parameter_values = parameter_values
 
     ocp.cost.cost_type = "NONLINEAR_LS"
@@ -453,15 +511,28 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成 Panda 任务空间位姿跟踪 NMPC 的 acados C 代码")
     parser.add_argument("--urdf", type=str, required=True, help="Panda URDF 路径")
+    parser.add_argument(
+        "--scene-xml",
+        type=str,
+        default="/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml",
+        help="MuJoCo scene XML 路径。仅用于和仿真场景保持同步。",
+    )
+    parser.add_argument(
+        "--obstacle-config",
+        type=str,
+        default="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
+        help="静态球障碍统一配置路径。acados codegen 将优先从这里读取。",
+    )
     parser.add_argument("--ee-frame", type=str, default="ee_center_body", help="末端 frame 名")
     parser.add_argument("--dt", type=float, default=0.02, help="采样时间")
-    parser.add_argument("--N", type=int, default=20, help="预测步数")
+    parser.add_argument("--N", type=int, default=50, help="预测步数")
     parser.add_argument("--solver-name", type=str, default="panda_task_space_nmpc", help="solver 名称")
     parser.add_argument("--json-file", type=str, default="panda_task_space_nmpc.json", help="json 文件名")
     parser.add_argument("--code-export-dir", type=str, default="c_generated_code", help="C 代码导出目录")
-    parser.add_argument("--num-obstacles", type=int, default=1, help="每个 stage 传入的球障碍数量")
     parser.add_argument("--safety-margin", type=float, default=0.01, help="机械臂球与障碍物球之间的额外安全裕度 [m]")
     args = parser.parse_args()
+
+    scene_obstacles = load_static_sphere_obstacles(args.obstacle_config)
 
     cfg = OcpConfig(
         dt=args.dt,
@@ -470,19 +541,22 @@ def main() -> None:
         json_file=args.json_file,
         code_export_dir=args.code_export_dir,
         obstacle=ObstacleSoftConstraintConfig(
-            num_obstacles=args.num_obstacles,
+            num_obstacles=len(scene_obstacles),
             safety_margin=args.safety_margin,
         ),
     )
 
     robot_spheres = load_robot_spheres_from_urdf(args.urdf)
-    ocp = build_acados_ocp(args.urdf, args.ee_frame, cfg)
+    ocp = build_acados_ocp(args.urdf, args.obstacle_config, args.ee_frame, cfg)
 
     print("开始生成 Panda 任务空间位姿跟踪 NMPC 的 acados C 代码...")
     print(f"URDF: {args.urdf}")
+    print(f"Scene XML: {args.scene_xml}")
+    print(f"Obstacle config: {args.obstacle_config}")
     print(f"EE frame: {args.ee_frame}")
     print(f"solver name: {cfg.solver_name}")
     print(f"从 URDF 中读取到机械臂球包络数量: {len(robot_spheres)}")
+    print(f"从障碍物配置中读取到静态球障碍数量: {len(scene_obstacles)}")
     print(
         f"参数维度 np = {cfg.np_stage} = p_ref(3) + R_ref(9) + q_nom(7)"
         f" + v_ee_ref(3) + w_ee_ref(3)"

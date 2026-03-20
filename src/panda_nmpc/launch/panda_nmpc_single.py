@@ -3,14 +3,17 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterValue
+from launch_ros.parameter_descriptions import ParameterFile
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
     panda_ros_share = FindPackageShare("panda_ros")
+    panda_nmpc_share = FindPackageShare("panda_nmpc")
 
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_global_trajectory = LaunchConfiguration("use_global_trajectory")
+    nmpc_params_file = LaunchConfiguration("nmpc_params_file")
     urdf_path = LaunchConfiguration("urdf_path")
     ee_frame_name = LaunchConfiguration("ee_frame_name")
     joint_states_topic = LaunchConfiguration("joint_states_topic")
@@ -40,6 +43,7 @@ def generate_launch_description():
         executable="nmpc_tau",
         output="screen",
         parameters=[
+            ParameterFile(nmpc_params_file, allow_substs=True),
             {
                 "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                 "use_global_trajectory": ParameterValue(use_global_trajectory, value_type=bool),
@@ -75,6 +79,10 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("use_sim_time", default_value="true"),
             DeclareLaunchArgument("use_global_trajectory", default_value="false"),
+            DeclareLaunchArgument(
+                "nmpc_params_file",
+                default_value=PathJoinSubstitution([panda_nmpc_share, "config", "nmpc_tau.yaml"]),
+            ),
             DeclareLaunchArgument(
                 "urdf_path",
                 default_value=PathJoinSubstitution([panda_ros_share, "model", "panda_tau_sim.urdf"]),

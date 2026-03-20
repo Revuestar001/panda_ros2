@@ -15,6 +15,7 @@
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>trajectory_msgs</depend>
+  <depend>tinyxml2_vendor</depend>
 
   <depend>panda_interfaces</depend>
 
