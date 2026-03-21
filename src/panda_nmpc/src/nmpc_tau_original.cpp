@@ -184,19 +184,25 @@ private:
         const Vec7 current_q = jq_.head<7>();
         const Vec7 current_v = jv_.head<7>();
         const Vec7 q_nom = current_q;
+        const Vec7 dq_nom = Vec7::Zero();
+        const Vec7 ddq_nom = Vec7::Zero();
+        const Vec7 current_a = Vec7::Zero();
 
         const Vec3 filtered_target_pos = sorr_pos_.updatePosition(target_pos_);
         const Eigen::Quaterniond filtered_target_quat = sorr_rot_.updateOrientation(target_rot_);
         const Mat3 filtered_target_rot = filtered_target_quat.toRotationMatrix();
 
-        auto res = nmpc_solver_.NMPCSolve(
+        auto res = nmpc_solver_.NMPCSolveSingleTarget(
             filtered_target_pos,
             filtered_target_rot,
             q_nom,
+            dq_nom,
+            ddq_nom,
             sorr_pos_.getLinearVelocity(),
             sorr_rot_.getAngularVelocity(),
             current_q,
-            current_v
+            current_v,
+            current_a
         );
 
         if (res.status == 0) {

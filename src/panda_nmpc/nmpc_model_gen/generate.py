@@ -1,64 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-离线生成 Panda 任务空间位姿跟踪 NMPC 的 acados C 代码。
+为 Panda 7 自由度机械臂生成“单点末端位姿 NMPC”的 acados C 代码。
 
-这版在你现有“位姿误差 + q_nom 正则 + 关节速度/加速度正则 + 静态球障碍软约束”的基础上，
-只做两类必要增强：
-
-1) 参考参数扩展为“可接 MoveIt2 的时变参考”
-   - 仍然保持任务空间位姿为主任务；
-   - q_nom 仍然只是“正则/引导”，不是硬跟踪；
-   - 新增末端线速度/角速度参考，用于跟踪时变参考轨迹而不是只盯静态终点。
-
-2) 代价中加入末端速度误差（线速度 + 角速度）
-   - 对静态目标：v_ee_ref = 0, w_ee_ref = 0；
-   - 对 MoveIt2 给出的全局轨迹：ROS2 节点可在每个 stage 将关节轨迹经 FK/Jacobian
-     转成 p_ref_k, R_ref_k, v_ee_ref_k, w_ee_ref_k，并把 q_nom_k 一起传入。
-
-模型定义
---------
-状态:  x = [q, v]                                        in R^14
-控制:  u = a_ref                                         in R^7
-参数:  p = [p_ref(3), R_ref(9), q_nom(7),
-            v_ee_ref(3), w_ee_ref(3),
-            obs_0_center(3), obs_0_radius(1), ...]
-
-连续时间动力学
-------------
-q_dot = v
-v_dot = a_ref
-
-代价函数
---------
-stage:
-    || p_ee(q) - p_ref ||^2_Wp
-  + || e_R(q)          ||^2_WR
-  + || v_ee(q,v) - v_ee_ref ||^2_Wv_ee
-  + || w_ee(q,v) - w_ee_ref ||^2_Ww_ee
-  + || q - q_nom       ||^2_Wq
-  + || v               ||^2_Wv
-  + || a_ref           ||^2_Wa
-
-terminal:
-    || p_ee(q) - p_ref ||^2_Wp_e
-  + || e_R(q)          ||^2_WR_e
-  + || v_ee(q,v) - v_ee_ref ||^2_Wv_ee_e
-  + || w_ee(q,v) - w_ee_ref ||^2_Ww_ee_e
-  + || q - q_nom       ||^2_Wq_e
-  + || v               ||^2_Wv_e
-
-姿态误差
---------
-仍然采用经典几何控制里的 SO(3) 误差向量：
-    e_R = 0.5 * vee(R_ref^T R - R^T R_ref)
+本版严格匹配以下工程决策：
+1. 三阶积分器模型: x = [q, dq, ddq], u = jerk。
+2. 先只实现单点位姿跟踪；接口与数据结构保留到轨迹/路径扩展位。
+3. 不加入外部碰撞约束，但保留约束结构，后续可继续在 h / h_e 中扩展。
+4. 硬约束始终保留真实物理边界；额外通过“软舒适边界”做可切换的 soft handling。
+5. 使用连续时间动力学 + acados 标准显式积分器接口，避免 disc_dyn_expr 与现有 API 不匹配。
+6. 主代价保持 NONLINEAR_LS + GAUSS_NEWTON，便于 SQP_RTI 实时求解。
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 import casadi as ca
@@ -86,46 +43,35 @@ class PandaLimits:
     ddq_max: np.ndarray = field(
         default_factory=lambda: np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0], dtype=float)
     )
+    jerk_max: np.ndarray = field(
+        default_factory=lambda: np.array([7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0], dtype=float)
+    )
 
 
 @dataclass
 class WeightConfig:
-    # 位置仍然是主导任务
     pos: np.ndarray = field(default_factory=lambda: np.array([2500.0, 2500.0, 2500.0], dtype=float))
-    rot: np.ndarray = field(default_factory=lambda: np.array([100.0, 100.0, 100.0], dtype=float))
-
-    # === 新增: 末端速度误差权重（默认给小权重，避免压过位姿主任务） ===
+    rot: np.ndarray = field(default_factory=lambda: np.array([120.0, 120.0, 120.0], dtype=float))
     ee_lin_vel: np.ndarray = field(default_factory=lambda: np.array([5.0, 5.0, 5.0], dtype=float))
-    ee_ang_vel: np.ndarray = field(default_factory=lambda: np.array([2.0, 2.0, 2.0], dtype=float))
+    ee_ang_vel: np.ndarray = field(default_factory=lambda: np.array([3.0, 3.0, 3.0], dtype=float))
+    q_reg: np.ndarray = field(default_factory=lambda: np.array([0.2] * 7, dtype=float))
+    dq_reg: np.ndarray = field(default_factory=lambda: np.array([0.05] * 7, dtype=float))
+    ddq_reg: np.ndarray = field(default_factory=lambda: np.array([0.02] * 7, dtype=float))
+    jerk_reg: np.ndarray = field(default_factory=lambda: np.array([1.0e-4] * 7, dtype=float))
 
-    q_reg: np.ndarray = field(default_factory=lambda: np.array([0.5] * 7, dtype=float))
-    dq_reg: np.ndarray = field(default_factory=lambda: np.array([0.1] * 7, dtype=float))
-    ddq_reg: np.ndarray = field(default_factory=lambda: np.array([0.05] * 7, dtype=float))
-
-    pos_e: np.ndarray = field(default_factory=lambda: np.array([4000.0, 4000.0, 4000.0], dtype=float))
-    rot_e: np.ndarray = field(default_factory=lambda: np.array([200.0, 200.0, 200.0], dtype=float))
-
-    # === 新增: 终端速度误差权重（静态终点时通常对应 0 速度） ===
-    ee_lin_vel_e: np.ndarray = field(default_factory=lambda: np.array([10.0, 10.0, 10.0], dtype=float))
-    ee_ang_vel_e: np.ndarray = field(default_factory=lambda: np.array([4.0, 4.0, 4.0], dtype=float))
-
-    q_reg_e: np.ndarray = field(default_factory=lambda: np.array([1.0] * 7, dtype=float))
-    dq_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.2] * 7, dtype=float))
+    pos_e: np.ndarray = field(default_factory=lambda: np.array([5000.0, 5000.0, 5000.0], dtype=float))
+    rot_e: np.ndarray = field(default_factory=lambda: np.array([240.0, 240.0, 240.0], dtype=float))
+    ee_lin_vel_e: np.ndarray = field(default_factory=lambda: np.array([8.0, 8.0, 8.0], dtype=float))
+    ee_ang_vel_e: np.ndarray = field(default_factory=lambda: np.array([5.0, 5.0, 5.0], dtype=float))
+    q_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.4] * 7, dtype=float))
+    dq_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.1] * 7, dtype=float))
+    ddq_reg_e: np.ndarray = field(default_factory=lambda: np.array([0.05] * 7, dtype=float))
 
 
 @dataclass
-class ObstacleSoftConstraintConfig:
-    num_obstacles: int = 0
-    safety_margin: float = 0.03
-    slack_linear: float = 1.0e4
+class SoftConstraintPenalty:
+    slack_linear: float = 1.0e3
     slack_quadratic: float = 1.0e6
-
-
-@dataclass
-class RobotSphere:
-    frame_name: str
-    offset_xyz: np.ndarray
-    radius: float
 
 
 @dataclass
@@ -136,283 +82,163 @@ class OcpConfig:
     json_file: str = "panda_task_space_nmpc.json"
     code_export_dir: str = "c_generated_code"
     nlp_solver_type: str = "SQP_RTI"
-    qp_solver: str = "FULL_CONDENSING_HPIPM"
+    qp_solver: str = "PARTIAL_CONDENSING_HPIPM"
     hessian_approx: str = "GAUSS_NEWTON"
     integrator_type: str = "ERK"
     sim_method_num_stages: int = 4
     sim_method_num_steps: int = 1
     nlp_solver_max_iter: int = 50
+    qp_solver_cond_N: int = 5
     print_level: int = 0
+    levenberg_marquardt: float = 1.0e-6
     limits: PandaLimits = field(default_factory=PandaLimits)
     weights: WeightConfig = field(default_factory=WeightConfig)
-    obstacle: ObstacleSoftConstraintConfig = field(default_factory=ObstacleSoftConstraintConfig)
+    soft_penalty_stage: SoftConstraintPenalty = field(default_factory=SoftConstraintPenalty)
+    soft_penalty_terminal: SoftConstraintPenalty = field(
+        default_factory=lambda: SoftConstraintPenalty(slack_linear=2.0e3, slack_quadratic=2.0e6)
+    )
 
     @property
     def nx(self) -> int:
-        return 14
+        return 21
 
     @property
     def nu(self) -> int:
         return 7
 
     @property
-    def base_np_stage(self) -> int:
-        # === 修改: 在原 p_ref(3) + R_ref(9) + q_nom(7) 基础上增加 v_ee_ref(3) + w_ee_ref(3) ===
-        return 25
-
-    @property
     def np_stage(self) -> int:
-        return self.base_np_stage + 4 * self.obstacle.num_obstacles
+        # p_ref(3) + R_ref(9) + q_nom(7) + dq_nom(7) + ddq_nom(7) + ee_lin_vel_ref(3) + ee_ang_vel_ref(3)
+        return 39
 
     @property
     def ny(self) -> int:
-        # pos_err(3) + rot_err(3) + ee_lin_vel_err(3) + ee_ang_vel_err(3)
-        # + q_reg(7) + dq_reg(7) + ddq_reg(7)
-        return 33
+        # pos + rot + ee_twist + q + dq + ddq + jerk
+        return 40
 
     @property
     def ny_e(self) -> int:
-        # pos_err(3) + rot_err(3) + ee_lin_vel_err(3) + ee_ang_vel_err(3)
-        # + q_reg(7) + dq_reg(7)
-        return 26
+        # pos + rot + ee_twist + q + dq + ddq
+        return 33
+
+    @property
+    def nh(self) -> int:
+        # q upper/lower, dq upper/lower, ddq upper/lower, jerk upper/lower
+        return 56
+
+    @property
+    def nh_e(self) -> int:
+        # q upper/lower, dq upper/lower, ddq upper/lower
+        return 42
 
 
 def assert_fixed_base_7dof(model: pin.Model) -> None:
     if model.nq != 7 or model.nv != 7:
-        raise ValueError(
-            f"当前脚本假定是固定底座 7 轴 Panda 机械臂，但读取到 nq={model.nq}, nv={model.nv}。"
-        )
+        raise ValueError(f"当前脚本假定固定底座 7 轴 Panda，但读取到 nq={model.nq}, nv={model.nv}。")
 
 
 def resolve_frame_id(model: pin.Model, frame_name: str) -> int:
     if model.existFrame(frame_name):
         return model.getFrameId(frame_name)
-    frame_names = [f.name for f in model.frames]
-    raise ValueError(f"URDF 中未找到 frame '{frame_name}'。可用 frame 示例: {frame_names[:20]}")
+    names = [frame.name for frame in model.frames]
+    raise ValueError(f"URDF 中未找到 frame '{frame_name}'，前几个 frame: {names[:20]}")
 
 
 def vee_of_skew(M: ca.SX) -> ca.SX:
     return ca.vertcat(M[2, 1], M[0, 2], M[1, 0])
 
 
-def _parse_xyz_attr(xyz_text: str | None) -> np.ndarray:
-    if xyz_text is None:
-        return np.zeros(3, dtype=float)
-    vals = [float(v) for v in xyz_text.strip().split()]
-    if len(vals) != 3:
-        raise ValueError(f"非法 xyz 字段: {xyz_text}")
-    return np.array(vals, dtype=float)
-
-
-def load_robot_spheres_from_urdf(urdf_path: str) -> list[RobotSphere]:
-    tree = ET.parse(urdf_path)
-    root = tree.getroot()
-
-    spheres: list[RobotSphere] = []
-    for link_elem in root.findall("link"):
-        link_name = link_elem.get("name")
-        if link_name is None:
-            continue
-
-        for visual_elem in link_elem.findall("visual"):
-            geometry_elem = visual_elem.find("geometry")
-            if geometry_elem is None:
-                continue
-
-            sphere_elem = geometry_elem.find("sphere")
-            if sphere_elem is None:
-                continue
-
-            radius_text = sphere_elem.get("radius")
-            if radius_text is None:
-                continue
-
-            origin_elem = visual_elem.find("origin")
-            offset_xyz = _parse_xyz_attr(None if origin_elem is None else origin_elem.get("xyz"))
-            radius = float(radius_text)
-
-            spheres.append(
-                RobotSphere(
-                    frame_name=link_name,
-                    offset_xyz=offset_xyz,
-                    radius=radius,
-                )
-            )
-
-    return spheres
-
-
-def load_static_sphere_obstacles(scene_xml_path: str) -> list[tuple[str, np.ndarray, float]]:
-    tree = ET.parse(scene_xml_path)
-    root = tree.getroot()
-
-    if root.tag == "static_sphere_obstacles":
-        obstacles: list[tuple[str, np.ndarray, float]] = []
-        for obstacle_elem in root.findall("obstacle"):
-            body_name = obstacle_elem.get("name")
-            pos_attr = obstacle_elem.get("pos")
-            radius_attr = obstacle_elem.get("radius")
-            if body_name is None or pos_attr is None or radius_attr is None:
-                raise ValueError(
-                    f"球障碍配置项必须包含 name/pos/radius。文件: {scene_xml_path}"
-                )
-
-            center = _parse_xyz_attr(pos_attr)
-            radius = float(radius_attr)
-            obstacles.append((body_name, center, radius))
-        return obstacles
-
-    worldbody_elem = root.find("worldbody")
-    if worldbody_elem is None:
-        raise ValueError(f"场景文件中未找到 <worldbody>: {scene_xml_path}")
-
-    obstacles: list[tuple[str, np.ndarray, float]] = []
-    for body_elem in worldbody_elem.findall("body"):
-        geom_elem = body_elem.find("geom")
-        if geom_elem is None or geom_elem.get("type") != "sphere":
-            continue
-
-        body_name = body_elem.get("name")
-        pos_attr = body_elem.get("pos")
-        size_attr = geom_elem.get("size")
-        if body_name is None or pos_attr is None or size_attr is None:
-            raise ValueError(
-                f"球障碍 body 必须包含 name/pos，geom 必须包含 size。文件: {scene_xml_path}"
-            )
-
-        center = _parse_xyz_attr(pos_attr)
-        radius = float(size_attr.strip().split()[0])
-        obstacles.append((body_name, center, radius))
-
-    return obstacles
-
-
-def build_acados_ocp(urdf_path: str, obstacle_source_path: str, ee_frame_name: str, cfg: OcpConfig) -> AcadosOcp:
+def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> AcadosOcp:
     if not os.path.exists(urdf_path):
         raise FileNotFoundError(f"找不到 URDF 文件: {urdf_path}")
-    if not os.path.exists(obstacle_source_path):
-        raise FileNotFoundError(f"找不到障碍物配置文件: {obstacle_source_path}")
 
     pin_model = pin.buildModelFromUrdf(urdf_path)
     assert_fixed_base_7dof(pin_model)
     ee_frame_id = resolve_frame_id(pin_model, ee_frame_name)
 
-    robot_spheres = load_robot_spheres_from_urdf(urdf_path)
-    scene_obstacles = load_static_sphere_obstacles(obstacle_source_path)
-    if len(robot_spheres) == 0:
-        raise ValueError(
-            "在 URDF 中没有解析到任何 <visual><geometry><sphere/></geometry></visual> 球体，"
-            "无法构造机械臂避障约束。"
-        )
-    if len(scene_obstacles) == 0:
-        raise ValueError(
-            "在 MuJoCo scene 中没有解析到任何静态球障碍，"
-            "请先在静态球障碍配置中放置至少一个球障碍。"
-        )
-    if cfg.obstacle.num_obstacles != len(scene_obstacles):
-        raise ValueError(
-            "cfg.obstacle.num_obstacles 与障碍物配置中解析到的静态球障碍数量不一致："
-            f"{cfg.obstacle.num_obstacles} != {len(scene_obstacles)}"
-        )
-    for sphere in robot_spheres:
-        _ = resolve_frame_id(pin_model, sphere.frame_name)
-
     cmodel = cpin.Model(pin_model)
     cdata = cmodel.createData()
 
     q = ca.SX.sym("q", 7, 1)
-    v = ca.SX.sym("v", 7, 1)
-    x = ca.vertcat(q, v)
+    dq = ca.SX.sym("dq", 7, 1)
+    ddq = ca.SX.sym("ddq", 7, 1)
+    x = ca.vertcat(q, dq, ddq)
 
-    xdot = ca.SX.sym("xdot", 14, 1)
-    a_ref = ca.SX.sym("a_ref", 7, 1)
+    xdot = ca.SX.sym("xdot", cfg.nx, 1)
+    jerk = ca.SX.sym("jerk", 7, 1)
 
     p = ca.SX.sym("p", cfg.np_stage, 1)
-
-    # === 参数布局 ===
-    # p_ref(3), R_ref(9), q_nom(7), v_ee_ref(3), w_ee_ref(3), obstacles...
     p_ref = p[0:3]
-    R_ref = ca.reshape(p[3:12], 3, 3)  # 列主序恢复
+    R_ref = ca.reshape(p[3:12], 3, 3)
     q_nom = p[12:19]
-    ee_lin_vel_ref = p[19:22]
-    ee_ang_vel_ref = p[22:25]
+    dq_nom = p[19:26]
+    ddq_nom = p[26:33]
+    ee_lin_vel_ref = p[33:36]
+    ee_ang_vel_ref = p[36:39]
 
-    obstacle_params_offset = cfg.base_np_stage
-    obstacle_list: list[tuple[ca.SX, ca.SX]] = []
-    for obs_idx, _ in enumerate(scene_obstacles):
-        off = obstacle_params_offset + 4 * obs_idx
-        obs_center = p[off:off + 3]
-        obs_radius = p[off + 3]
-        obstacle_list.append((obs_center, obs_radius))
-
-    f_expl = ca.vertcat(v, a_ref)
+    f_expl = ca.vertcat(dq, ddq, jerk)
     f_impl = xdot - f_expl
 
-    cpin.framesForwardKinematics(cmodel, cdata, q)
+    cpin.forwardKinematics(cmodel, cdata, q)
+    cpin.updateFramePlacements(cmodel, cdata)
     p_ee = cdata.oMf[ee_frame_id].translation
     R_ee = cdata.oMf[ee_frame_id].rotation
 
-    # === 新增: 末端几何速度（LOCAL_WORLD_ALIGNED 下，Pinocchio 空间速度顺序为 [linear; anguler]） ===
     J_ee_lwa = cpin.computeFrameJacobian(cmodel, cdata, q, ee_frame_id, pin.LOCAL_WORLD_ALIGNED)
-    ee_lin_vel = J_ee_lwa[0:3, :] @ v
-    ee_ang_vel = J_ee_lwa[3:6, :] @ v
+    ee_lin_vel = J_ee_lwa[0:3, :] @ dq
+    ee_ang_vel = J_ee_lwa[3:6, :] @ dq
 
     pos_err = p_ee - p_ref
     R_err_mat = R_ref.T @ R_ee - R_ee.T @ R_ref
     rot_err = 0.5 * vee_of_skew(R_err_mat)
-
     ee_lin_vel_err = ee_lin_vel - ee_lin_vel_ref
     ee_ang_vel_err = ee_ang_vel - ee_ang_vel_ref
 
     cost_y = ca.vertcat(
-        pos_err,           # 3
-        rot_err,           # 3
-        ee_lin_vel_err,    # 3
-        ee_ang_vel_err,    # 3
-        q - q_nom,         # 7
-        v,                 # 7
-        a_ref,             # 7
+        pos_err,
+        rot_err,
+        ee_lin_vel_err,
+        ee_ang_vel_err,
+        q - q_nom,
+        dq - dq_nom,
+        ddq - ddq_nom,
+        jerk,
+    )
+    cost_y_e = ca.vertcat(
+        pos_err,
+        rot_err,
+        ee_lin_vel_err,
+        ee_ang_vel_err,
+        q - q_nom,
+        dq - dq_nom,
+        ddq - ddq_nom,
     )
 
-    cost_y_e = ca.vertcat(
-        pos_err,           # 3
-        rot_err,           # 3
-        ee_lin_vel_err,    # 3
-        ee_ang_vel_err,    # 3
-        q - q_nom,         # 7
-        v,                 # 7
+    # 软舒适边界：h(x,u) <= uh，lh = -inf。
+    h_expr = ca.vertcat(
+        q, -q,
+        dq, -dq,
+        ddq, -ddq,
+        jerk, -jerk,
+    )
+    h_expr_e = ca.vertcat(
+        q, -q,
+        dq, -dq,
+        ddq, -ddq,
     )
 
     model = AcadosModel()
     model.name = cfg.solver_name
     model.x = x
     model.xdot = xdot
-    model.u = a_ref
+    model.u = jerk
     model.p = p
     model.f_expl_expr = f_expl
     model.f_impl_expr = f_impl
     model.cost_y_expr = cost_y
     model.cost_y_expr_e = cost_y_e
-
-    def sphere_center_world_expr(sphere: RobotSphere) -> ca.SX:
-        sphere_frame_id = resolve_frame_id(pin_model, sphere.frame_name)
-        T_w_link = cdata.oMf[sphere_frame_id]
-        offset_local = ca.DM(np.asarray(sphere.offset_xyz, dtype=float)).reshape((3, 1))
-        return T_w_link.translation + T_w_link.rotation @ offset_local
-
-    h_expr_list: list[ca.SX] = []
-    for sphere in robot_spheres:
-        sphere_center_world = sphere_center_world_expr(sphere)
-
-        for obs_center, obs_radius in obstacle_list:
-            min_allowed_dist = sphere.radius + obs_radius + cfg.obstacle.safety_margin
-            h_ij = ca.sumsqr(sphere_center_world - obs_center) - min_allowed_dist**2
-            h_expr_list.append(h_ij)
-
-    if len(h_expr_list) > 0:
-        con_h_expr = ca.vertcat(*h_expr_list)
-        model.con_h_expr = con_h_expr
-        model.con_h_expr_e = con_h_expr
+    model.con_h_expr = h_expr
+    model.con_h_expr_e = h_expr_e
 
     ocp = AcadosOcp()
     ocp.model = model
@@ -420,14 +246,7 @@ def build_acados_ocp(urdf_path: str, obstacle_source_path: str, ee_frame_name: s
     ocp.solver_options.tf = cfg.horizon_steps * cfg.dt
 
     parameter_values = np.zeros(cfg.np_stage, dtype=float)
-    # 默认 R_ref 为单位阵，避免未设置时出现无意义旋转参考
     parameter_values[3:12] = np.eye(3, dtype=float).reshape(-1, order="F")
-    # 默认末端速度参考为 0，适用于静态目标
-    parameter_values[19:25] = 0.0
-    for obs_idx, (_, obs_center, obs_radius) in enumerate(scene_obstacles):
-        off = cfg.base_np_stage + 4 * obs_idx
-        parameter_values[off:off + 3] = obs_center
-        parameter_values[off + 3] = obs_radius
     ocp.parameter_values = parameter_values
 
     ocp.cost.cost_type = "NONLINEAR_LS"
@@ -435,36 +254,34 @@ def build_acados_ocp(urdf_path: str, obstacle_source_path: str, ee_frame_name: s
 
     w = cfg.weights
     ocp.cost.W = np.diag(
-        np.concatenate(
-            [
-                w.pos,
-                w.rot,
-                w.ee_lin_vel,
-                w.ee_ang_vel,
-                w.q_reg,
-                w.dq_reg,
-                w.ddq_reg,
-            ]
-        )
+        np.concatenate([
+            w.pos,
+            w.rot,
+            w.ee_lin_vel,
+            w.ee_ang_vel,
+            w.q_reg,
+            w.dq_reg,
+            w.ddq_reg,
+            w.jerk_reg,
+        ])
     )
     ocp.cost.W_e = np.diag(
-        np.concatenate(
-            [
-                w.pos_e,
-                w.rot_e,
-                w.ee_lin_vel_e,
-                w.ee_ang_vel_e,
-                w.q_reg_e,
-                w.dq_reg_e,
-            ]
-        )
+        np.concatenate([
+            w.pos_e,
+            w.rot_e,
+            w.ee_lin_vel_e,
+            w.ee_ang_vel_e,
+            w.q_reg_e,
+            w.dq_reg_e,
+            w.ddq_reg_e,
+        ])
     )
     ocp.cost.yref = np.zeros(cfg.ny, dtype=float)
     ocp.cost.yref_e = np.zeros(cfg.ny_e, dtype=float)
 
     lim = cfg.limits
-    x_min = np.concatenate([lim.q_min, -lim.dq_max])
-    x_max = np.concatenate([lim.q_max, lim.dq_max])
+    x_min = np.concatenate([lim.q_min, -lim.dq_max, -lim.ddq_max])
+    x_max = np.concatenate([lim.q_max, lim.dq_max, lim.ddq_max])
 
     ocp.constraints.idxbx = np.arange(cfg.nx, dtype=int)
     ocp.constraints.lbx = x_min
@@ -475,67 +292,51 @@ def build_acados_ocp(urdf_path: str, obstacle_source_path: str, ee_frame_name: s
     ocp.constraints.x0 = np.zeros(cfg.nx, dtype=float)
 
     ocp.constraints.idxbu = np.arange(cfg.nu, dtype=int)
-    ocp.constraints.lbu = -lim.ddq_max
-    ocp.constraints.ubu = lim.ddq_max
+    ocp.constraints.lbu = -lim.jerk_max
+    ocp.constraints.ubu = lim.jerk_max
 
-    if len(h_expr_list) > 0:
-        nh = len(h_expr_list)
-        ocp.constraints.lh = np.zeros(nh, dtype=float)
-        ocp.constraints.uh = 1.0e15 * np.ones(nh, dtype=float)
-        ocp.constraints.lh_e = np.zeros(nh, dtype=float)
-        ocp.constraints.uh_e = 1.0e15 * np.ones(nh, dtype=float)
+    ocp.constraints.lh = -1.0e15 * np.ones(cfg.nh, dtype=float)
+    ocp.constraints.uh = 1.0e15 * np.ones(cfg.nh, dtype=float)
+    ocp.constraints.lh_e = -1.0e15 * np.ones(cfg.nh_e, dtype=float)
+    ocp.constraints.uh_e = 1.0e15 * np.ones(cfg.nh_e, dtype=float)
+    ocp.constraints.idxsh = np.arange(cfg.nh, dtype=int)
+    ocp.constraints.idxsh_e = np.arange(cfg.nh_e, dtype=int)
 
-        ocp.constraints.idxsh = np.arange(nh, dtype=int)
-        ocp.constraints.idxsh_e = np.arange(nh, dtype=int)
+    ocp.cost.Zl = cfg.soft_penalty_stage.slack_quadratic * np.ones(cfg.nh, dtype=float)
+    ocp.cost.Zu = cfg.soft_penalty_stage.slack_quadratic * np.ones(cfg.nh, dtype=float)
+    ocp.cost.zl = cfg.soft_penalty_stage.slack_linear * np.ones(cfg.nh, dtype=float)
+    ocp.cost.zu = cfg.soft_penalty_stage.slack_linear * np.ones(cfg.nh, dtype=float)
 
-        ocp.cost.Zl = cfg.obstacle.slack_quadratic * np.ones(nh, dtype=float)
-        ocp.cost.Zu = cfg.obstacle.slack_quadratic * np.ones(nh, dtype=float)
-        ocp.cost.zl = cfg.obstacle.slack_linear * np.ones(nh, dtype=float)
-        ocp.cost.zu = cfg.obstacle.slack_linear * np.ones(nh, dtype=float)
-
-        ocp.cost.Zl_e = cfg.obstacle.slack_quadratic * np.ones(nh, dtype=float)
-        ocp.cost.Zu_e = cfg.obstacle.slack_quadratic * np.ones(nh, dtype=float)
-        ocp.cost.zl_e = cfg.obstacle.slack_linear * np.ones(nh, dtype=float)
-        ocp.cost.zu_e = cfg.obstacle.slack_linear * np.ones(nh, dtype=float)
+    ocp.cost.Zl_e = cfg.soft_penalty_terminal.slack_quadratic * np.ones(cfg.nh_e, dtype=float)
+    ocp.cost.Zu_e = cfg.soft_penalty_terminal.slack_quadratic * np.ones(cfg.nh_e, dtype=float)
+    ocp.cost.zl_e = cfg.soft_penalty_terminal.slack_linear * np.ones(cfg.nh_e, dtype=float)
+    ocp.cost.zu_e = cfg.soft_penalty_terminal.slack_linear * np.ones(cfg.nh_e, dtype=float)
 
     ocp.solver_options.qp_solver = cfg.qp_solver
+    ocp.solver_options.qp_solver_cond_N = min(cfg.qp_solver_cond_N, cfg.horizon_steps)
     ocp.solver_options.hessian_approx = cfg.hessian_approx
     ocp.solver_options.integrator_type = cfg.integrator_type
-    ocp.solver_options.nlp_solver_type = cfg.nlp_solver_type
     ocp.solver_options.sim_method_num_stages = cfg.sim_method_num_stages
     ocp.solver_options.sim_method_num_steps = cfg.sim_method_num_steps
+    ocp.solver_options.nlp_solver_type = cfg.nlp_solver_type
     ocp.solver_options.nlp_solver_max_iter = cfg.nlp_solver_max_iter
     ocp.solver_options.print_level = cfg.print_level
+    ocp.solver_options.levenberg_marquardt = cfg.levenberg_marquardt
 
     ocp.code_export_directory = cfg.code_export_dir
     return ocp
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="生成 Panda 任务空间位姿跟踪 NMPC 的 acados C 代码")
+    parser = argparse.ArgumentParser(description="生成 Panda 三阶积分器单点位姿 NMPC 的 acados C 代码")
     parser.add_argument("--urdf", type=str, required=True, help="Panda URDF 路径")
-    parser.add_argument(
-        "--scene-xml",
-        type=str,
-        default="/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml",
-        help="MuJoCo scene XML 路径。仅用于和仿真场景保持同步。",
-    )
-    parser.add_argument(
-        "--obstacle-config",
-        type=str,
-        default="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
-        help="静态球障碍统一配置路径。acados codegen 将优先从这里读取。",
-    )
     parser.add_argument("--ee-frame", type=str, default="ee_center_body", help="末端 frame 名")
     parser.add_argument("--dt", type=float, default=0.02, help="采样时间")
     parser.add_argument("--N", type=int, default=20, help="预测步数")
     parser.add_argument("--solver-name", type=str, default="panda_task_space_nmpc", help="solver 名称")
     parser.add_argument("--json-file", type=str, default="panda_task_space_nmpc.json", help="json 文件名")
-    parser.add_argument("--code-export-dir", type=str, default="c_generated_code", help="C 代码导出目录")
-    parser.add_argument("--safety-margin", type=float, default=0.05, help="机械臂球与障碍物球之间的额外安全裕度 [m]")
+    parser.add_argument("--code-export-dir", type=str, default="c_generated_code", help="代码导出目录")
     args = parser.parse_args()
-
-    scene_obstacles = load_static_sphere_obstacles(args.obstacle_config)
 
     cfg = OcpConfig(
         dt=args.dt,
@@ -543,40 +344,22 @@ def main() -> None:
         solver_name=args.solver_name,
         json_file=args.json_file,
         code_export_dir=args.code_export_dir,
-        obstacle=ObstacleSoftConstraintConfig(
-            num_obstacles=len(scene_obstacles),
-            safety_margin=args.safety_margin,
-        ),
     )
+    ocp = build_acados_ocp(args.urdf, args.ee_frame, cfg)
 
-    robot_spheres = load_robot_spheres_from_urdf(args.urdf)
-    ocp = build_acados_ocp(args.urdf, args.obstacle_config, args.ee_frame, cfg)
-    obstacle_constraint_count = len(robot_spheres) * cfg.obstacle.num_obstacles
-
-    print("开始生成 Panda 任务空间位姿跟踪 NMPC 的 acados C 代码...")
+    print("开始生成 Panda 三阶积分器单点位姿 NMPC acados C 代码...")
     print(f"URDF: {args.urdf}")
-    print(f"Scene XML: {args.scene_xml}")
-    print(f"Obstacle config: {args.obstacle_config}")
     print(f"EE frame: {args.ee_frame}")
-    print(f"solver name: {cfg.solver_name}")
-    print(f"从 URDF 中读取到机械臂球包络数量: {len(robot_spheres)}")
-    print(f"从障碍物配置中读取到静态球障碍数量: {len(scene_obstacles)}")
+    print(f"dt: {cfg.dt}")
+    print(f"N: {cfg.horizon_steps}")
+    print(f"solver: {cfg.solver_name}")
     print(
-        f"参数维度 np = {cfg.np_stage} = p_ref(3) + R_ref(9) + q_nom(7)"
-        f" + v_ee_ref(3) + w_ee_ref(3)"
-        f" + obs_center(3)/obs_radius(1) * {cfg.obstacle.num_obstacles}"
-    )
-    print(
-        f"输出维度 ny = {cfg.ny} = pos(3) + rot(3) + ee_lin_vel(3) + ee_ang_vel(3)"
-        f" + q_reg(7) + dq_reg(7) + ddq_reg(7)"
-    )
-    print(
-        f"避障约束数量 nh = {obstacle_constraint_count}"
-        f" = robot_spheres({len(robot_spheres)}) * obstacles({cfg.obstacle.num_obstacles})"
+        f"nx={cfg.nx}, nu={cfg.nu}, np={cfg.np_stage}, ny={cfg.ny}, ny_e={cfg.ny_e}, "
+        f"nh={cfg.nh}, nh_e={cfg.nh_e}, integrator={cfg.integrator_type}"
     )
 
     AcadosOcpSolver(ocp, json_file=cfg.json_file)
-    print("生成成功！")
+    print("生成成功。")
 
 
 if __name__ == "__main__":
