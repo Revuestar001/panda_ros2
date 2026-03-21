@@ -532,7 +532,7 @@ def main() -> None:
     parser.add_argument("--solver-name", type=str, default="panda_task_space_nmpc", help="solver 名称")
     parser.add_argument("--json-file", type=str, default="panda_task_space_nmpc.json", help="json 文件名")
     parser.add_argument("--code-export-dir", type=str, default="c_generated_code", help="C 代码导出目录")
-    parser.add_argument("--safety-margin", type=float, default=0.01, help="机械臂球与障碍物球之间的额外安全裕度 [m]")
+    parser.add_argument("--safety-margin", type=float, default=0.05, help="机械臂球与障碍物球之间的额外安全裕度 [m]")
     args = parser.parse_args()
 
     scene_obstacles = load_static_sphere_obstacles(args.obstacle_config)

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <chrono>
 #include <exception>
+#include <sstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -190,6 +191,32 @@ private:
             runtime_obstacle_params_[offset + 2] = obstacle.center.z();
             runtime_obstacle_params_[offset + 3] = obstacle.radius;
         }
+
+        std::ostringstream obstacle_stream;
+        obstacle_stream << "Loaded " << scene_obstacles_.size()
+                        << " static sphere obstacles from '" << obstacle_source_path
+                        << "'. Applied " << obstacle_count << " obstacle(s) to NMPC runtime params";
+        if (scene_obstacles_.size() > obstacle_count) {
+            obstacle_stream << " (" << (scene_obstacles_.size() - obstacle_count)
+                            << " ignored because solver capacity is "
+                            << PandaNMPCController::kNumRuntimeObstacles << ")";
+        }
+        obstacle_stream << ": ";
+
+        for (std::size_t obstacle_idx = 0; obstacle_idx < obstacle_count; ++obstacle_idx) {
+            const auto& obstacle = scene_obstacles_[obstacle_idx];
+            if (obstacle_idx > 0) {
+                obstacle_stream << "; ";
+            }
+            obstacle_stream << "[" << obstacle_idx << "] "
+                            << obstacle.name
+                            << " pos=("
+                            << obstacle.center.x() << ", "
+                            << obstacle.center.y() << ", "
+                            << obstacle.center.z() << ")"
+                            << " radius=" << obstacle.radius;
+        }
+        RCLCPP_INFO(this->get_logger(), "%s", obstacle_stream.str().c_str());
     }
 
     void declare_startup_parameters() {
@@ -661,7 +688,7 @@ private:
             res = nmpc_solver_.NMPCSolve(
                 filtered_target_pos,
                 filtered_target_rot,
-                reference_q_.head<7>(),     // 先继续使用当前关节角作为 q_nom，避免零空间突然拉扯
+                reference_q_.head<7>(),
                 sorr_pos_.getLinearVelocity(),
                 sorr_rot_.getAngularVelocity(),
                 runtime_obstacle_params_,
@@ -722,7 +749,6 @@ private:
         } else {
             target_rot_ = target_quat.normalized().toRotationMatrix();
         }
-
     }
 
     void joint_states_callback(const sensor_msgs::msg::JointState::SharedPtr msg) {
