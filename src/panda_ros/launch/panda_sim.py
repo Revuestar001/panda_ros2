@@ -40,9 +40,9 @@ Usage:
 import os
 import subprocess
 
-from ament_index_python.packages import get_package_prefix
+from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction, Shutdown
 from launch.substitutions import (
     Command,
     FindExecutable,
@@ -56,25 +56,12 @@ from launch_ros.substitutions import FindPackageShare
 
 def launch_setup(context, *args, **kwargs):
     pkg_share = FindPackageShare("panda_ros")
+    sync_scene = LaunchConfiguration("sync_scene").perform(context).strip().lower()
 
-    obstacle_config_path = LaunchConfiguration("obstacle_config_path").perform(context)
-    scene_xml_path = LaunchConfiguration("scene_xml_path").perform(context)
-    sync_executable = os.path.join(
-        get_package_prefix("panda_nmpc"),
-        "lib",
-        "panda_nmpc",
-        "sync_static_sphere_scene.py",
-    )
-    subprocess.run(
-        [
-            sync_executable,
-            "--obstacle-config",
-            obstacle_config_path,
-            "--scene-xml",
-            scene_xml_path,
-        ],
-        check=True,
-    )
+    if sync_scene not in {"auto", "true", "false"}:
+        raise RuntimeError(
+            "Invalid value for 'sync_scene'. Expected one of: auto, true, false."
+        )
 
     # Build robot description with PID control enabled
     # This uses demo_resources/scenes/scene_pid.xml which includes the PID robot model
@@ -96,6 +83,43 @@ def launch_setup(context, *args, **kwargs):
     parameters_file = PathJoinSubstitution([pkg_share, "config", "pinoController.yaml"])
 
     nodes = []
+
+    if sync_scene != "false":
+        obstacle_config_path = LaunchConfiguration("obstacle_config_path").perform(context)
+        scene_xml_path = LaunchConfiguration("scene_xml_path").perform(context)
+
+        try:
+            sync_executable = os.path.join(
+                get_package_prefix("panda_nmpc"),
+                "lib",
+                "panda_nmpc",
+                "sync_static_sphere_scene.py",
+            )
+        except PackageNotFoundError:
+            if sync_scene == "true":
+                raise RuntimeError(
+                    "sync_scene:=true was requested, but package 'panda_nmpc' is not installed."
+                )
+
+            nodes.append(
+                LogInfo(
+                    msg=(
+                        "Package 'panda_nmpc' not found. Skipping obstacle scene sync and "
+                        "continuing with panda_ros only."
+                    )
+                )
+            )
+        else:
+            subprocess.run(
+                [
+                    sync_executable,
+                    "--obstacle-config",
+                    obstacle_config_path,
+                    "--scene-xml",
+                    scene_xml_path,
+                ],
+                check=True,
+            )
 
     # Robot state publisher
     nodes.append(
@@ -161,6 +185,11 @@ def generate_launch_description():
         default_value="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
         description="Canonical static sphere obstacle config shared by MuJoCo, MoveIt and acados",
     )
+    sync_scene = DeclareLaunchArgument(
+        "sync_scene",
+        default_value="auto",
+        description="Sync static sphere obstacles via panda_nmpc before launch: auto, true, or false",
+    )
     scene_xml_path = DeclareLaunchArgument(
         "scene_xml_path",
         default_value="/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml",
@@ -171,6 +200,7 @@ def generate_launch_description():
         [
             headless,
             obstacle_config_path,
+            sync_scene,
             scene_xml_path,
             OpaqueFunction(function=launch_setup),
         ]
