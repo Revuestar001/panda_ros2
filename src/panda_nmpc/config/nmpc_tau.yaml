@@ -12,9 +12,9 @@ nmpc_tau_node:
     nmpc_result_topic: "/nmpc_result"
     target_pose_topic: "/global_target_pose"
 
-    target_x: 0.2
+    target_x: 0.6
     target_y: -0.00
-    target_z: 0.25
+    target_z: 0.5
     target_qx: 1.0
     target_qy: 0.0
     target_qz: 0.0
@@ -30,7 +30,7 @@ nmpc_tau_node:
     sorr_pos_damping_ratio: 1.0
     sorr_pos_natural_frequency: 10.0
     sorr_pos_max_linear_velocity: 0.1
-    sorr_pos_max_linear_acceleration: 1.0
+    sorr_pos_max_linear_acceleration: 0.5
 
     sorr_rot_damping_ratio: 1.0
     sorr_rot_natural_frequency: 10.0
@@ -61,7 +61,7 @@ nmpc_tau_node:
       soft_constraint:
         stage:
           slack_linear: 0.0
-          slack_quadratic: 100000.0
+          slack_quadratic: 1000000.0
         terminal:
           slack_linear: 0.0
-          slack_quadratic: 100000.0
+          slack_quadratic: 1000000.0
