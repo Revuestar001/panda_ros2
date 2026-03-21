@@ -835,7 +835,7 @@ public:
         reference_q_ = Eigen::VectorXd::Zero(7);
         // reference_q_ << 0.0, -1.57, 0.785, -2.356, 0.0, 1.571, 0.785;
         initial_q_ << 0.008, -1.382, -0.008, -3.072, -0.007, 1.615, 0.792;
-        reference_q_ << 0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785;
+        reference_q_ << 0.0, -0.0, 0.0, -1.5708, 0.0, 1.8675, 0.0;
         jq_ = Eigen::VectorXd::Zero(7);
         jv_ = Eigen::VectorXd::Zero(7);
 
