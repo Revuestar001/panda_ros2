@@ -29,11 +29,11 @@ struct PandaArmNmpcConfig {
   scalar_t eePositionWeight = 200.0;
   scalar_t eeOrientationWeight = 60.0;
   scalar_t jointVelocityWeight = 0.05;
-  scalar_t jointAccelerationWeight = 5e-3;
+  scalar_t jointAccelerationWeight = 0.1;
 
-  scalar_t terminalEePositionWeight = 400.0;
-  scalar_t terminalEeOrientationWeight = 120.0;
-  scalar_t terminalJointVelocityWeight = 0.2;
+  scalar_t terminalEePositionWeight = 4000.0;
+  scalar_t terminalEeOrientationWeight = 1200.0;
+  scalar_t terminalJointVelocityWeight = 2.0;
 
   size_t nThreads = 3;
   size_t maxNumIterations = 1;

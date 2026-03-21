@@ -36,8 +36,8 @@ private:
     const double desire_rot_stiff = 50.0;
 
     // c-space impedance Control 
-    const double desire_joints_damp = 63.0;
-    const double desire_joints_stiff = 1000.0;
+    const double desire_joints_damp = 20.0;
+    const double desire_joints_stiff = 100.0;
 
 public:
     pinoSolver(const std::string& urdf_path, const std::string& ee_frame_name);

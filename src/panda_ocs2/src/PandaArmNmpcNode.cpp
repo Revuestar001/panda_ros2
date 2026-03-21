@@ -262,7 +262,8 @@ class PandaArmNmpcNode final : public rclcpp::Node {
       return;
     }
 
-    logControlDebug(observation, optimizedState, optimizedInput);
+    const vector_t integratedState = buildIntegratedStateReference(observation, optimizedInput);
+    logControlDebug(observation, optimizedState, integratedState, optimizedInput);
     publishResults(optimizedState, optimizedInput);
 
     std::lock_guard<std::mutex> lock(observationMutex_);
@@ -303,7 +304,18 @@ class PandaArmNmpcNode final : public rclcpp::Node {
     return TargetTrajectories({time}, {targetPose_}, {vector_t::Zero(kArmDim)});
   }
 
-  void logControlDebug(const SystemObservation& observation, const vector_t& optimizedState, const vector_t& optimizedInput) {
+  vector_t buildIntegratedStateReference(const SystemObservation& observation, const vector_t& optimizedInput) const {
+    vector_t integratedState = observation.state;
+    const auto currentQ = observation.state.head(kArmDim);
+    const auto currentV = observation.state.tail(kArmDim);
+    integratedState.head(kArmDim) =
+        currentQ + controlPeriod_ * currentV + 0.5 * controlPeriod_ * controlPeriod_ * optimizedInput;
+    integratedState.tail(kArmDim) = currentV + controlPeriod_ * optimizedInput;
+    return integratedState;
+  }
+
+  void logControlDebug(const SystemObservation& observation, const vector_t& optimizedState, const vector_t& integratedState,
+                       const vector_t& optimizedInput) {
     if (!runtimeDebug_ || controlCycleCount_ % static_cast<size_t>(controlDebugStride_) != 0) {
       return;
     }
@@ -312,8 +324,12 @@ class PandaArmNmpcNode final : public rclcpp::Node {
     const auto currentV = observation.state.tail(kArmDim);
     const auto qRef = optimizedState.head(kArmDim);
     const auto vRef = optimizedState.tail(kArmDim);
+    const auto qCmd = integratedState.head(kArmDim);
+    const auto vCmd = integratedState.tail(kArmDim);
     const double qErrNorm = (qRef - currentQ).norm();
     const double vErrNorm = (vRef - currentV).norm();
+    const double qCmdErrNorm = (qCmd - currentQ).norm();
+    const double vCmdErrNorm = (vCmd - currentV).norm();
     const Eigen::Vector3d currentEePosition = interface_->getEePosition(observation.state);
     const Eigen::Vector3d targetEePosition = targetPose_.head<3>();
     const double eePositionError = (currentEePosition - targetEePosition).norm();
@@ -322,10 +338,11 @@ class PandaArmNmpcNode final : public rclcpp::Node {
     const double eeOrientationErrorDeg = quaternionDistanceDeg(currentEeOrientation, targetEeOrientation);
 
     RCLCPP_INFO(this->get_logger(),
-                "NMPC ctrl #%zu t=%.3f q_err=%.4f v_err=%.4f ee_pos_err=%.4f "
-                "ee_rot_err_deg=%.2f a_max=%.3f q=%s q_ref=%s",
-                controlCycleCount_, observation.time, qErrNorm, vErrNorm, eePositionError, eeOrientationErrorDeg,
-                maxAbs(optimizedInput), formatVectorHead(currentQ, 4).c_str(), formatVectorHead(qRef, 4).c_str());
+                "NMPC ctrl #%zu t=%.3f q_err=%.4f v_err=%.4f q_cmd_err=%.4f v_cmd_err=%.4f ee_pos_err=%.4f "
+                "ee_rot_err_deg=%.2f a_max=%.3f q=%s q_ref=%s q_cmd=%s",
+                controlCycleCount_, observation.time, qErrNorm, vErrNorm, qCmdErrNorm, vCmdErrNorm, eePositionError,
+                eeOrientationErrorDeg, maxAbs(optimizedInput), formatVectorHead(currentQ, 4).c_str(),
+                formatVectorHead(qRef, 4).c_str(), formatVectorHead(qCmd, 4).c_str());
   }
 
   void publishResults(const vector_t& optimizedState, const vector_t& optimizedInput) {
