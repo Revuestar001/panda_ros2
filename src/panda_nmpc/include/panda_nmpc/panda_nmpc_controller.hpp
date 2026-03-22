@@ -30,6 +30,7 @@ static_assert(
     kPandaNmpcObstacleParamDim % kPandaNmpcObstacleValuesPerObstacle == 0,
     "Generated solver obstacle parameter block is inconsistent with xyzr packing.");
 
+// One-step command returned to the ROS node after a successful or failed solve.
 struct NMPCResult {
     Eigen::Matrix<double, 7, 1> q_ref{Eigen::Matrix<double, 7, 1>::Zero()};
     Eigen::Matrix<double, 7, 1> v_ref{Eigen::Matrix<double, 7, 1>::Zero()};
@@ -40,6 +41,8 @@ struct NMPCResult {
 
 using PandaNmpcObstacleParamBlock = std::array<double, kPandaNmpcObstacleParamDim>;
 
+// High-level per-stage reference consumed by the controller and packed into the
+// generated solver parameter vector.
 struct NMPCStageReference {
     Eigen::Matrix<double, 3, 1> target_pos{Eigen::Matrix<double, 3, 1>::Zero()};
     Eigen::Matrix<double, 3, 3> target_rot{Eigen::Matrix<double, 3, 3>::Identity()};
@@ -49,6 +52,7 @@ struct NMPCStageReference {
     PandaNmpcObstacleParamBlock obstacle_params{};
 };
 
+// Per-stage summary of slack activity used for low-frequency debug logging.
 struct NMPCDebugStageSlackInfo {
     int stage{-1};
     int slack_dim{0};
@@ -57,6 +61,8 @@ struct NMPCDebugStageSlackInfo {
     double sum_slack{0.0};
 };
 
+// Snapshot of the most recent acados solve, including timing, residuals and
+// soft-constraint activity.
 struct NMPCSolveDebugInfo {
     bool available{false};
     bool qp_status_available{false};
@@ -82,6 +88,12 @@ struct NMPCSolveDebugInfo {
 
 class PandaNMPCController {
 public:
+    // =========================================================================
+    // Basic Type Aliases and Public Configuration Types
+    // =========================================================================
+    // This wrapper exposes a small, stable C++ API on top of the generated
+    // acados solver so the ROS node never needs to manipulate raw solver
+    // handles directly.
     using Vec7 = Eigen::Matrix<double, 7, 1>;
     using Vec3 = Eigen::Matrix<double, 3, 1>;
     using Mat3 = Eigen::Matrix<double, 3, 3>;
@@ -94,6 +106,7 @@ public:
     static constexpr std::size_t kNumRuntimeObstacles =
         kPandaNmpcObstacleParamDim / kPandaNmpcObstacleValuesPerObstacle;
 
+    // Stage and terminal least-squares weights exposed as runtime parameters.
     struct CostWeights {
         std::array<double, 3> pos{{2500.0, 2500.0, 2500.0}};
         std::array<double, 3> rot{{100.0, 100.0, 100.0}};
@@ -111,6 +124,7 @@ public:
         std::array<double, 7> dq_reg_e{{0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2}};
     };
 
+    // Physical hard bounds that are always enforced by the OCP.
     struct HardLimits {
         std::array<double, 7> q_lower{{-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973}};
         std::array<double, 7> q_upper{{2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973}};
@@ -118,20 +132,27 @@ public:
         std::array<double, 7> ddq_abs{{15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0}};
     };
 
+    // Slack penalties for obstacle soft constraints.
     struct SoftConstraintPenalty {
         double slack_linear{0.0};
         double slack_quadratic{1.0e6};
     };
 
+    // Stage and terminal penalties are separate so terminal obstacle behavior
+    // can be tuned independently from intermediate stages.
     struct ObstacleConstraintConfig {
         SoftConstraintPenalty stage_penalty{};
         SoftConstraintPenalty terminal_penalty{};
     };
 
+    // Canonical defaults live in the controller so YAML, tests and code paths
+    // all share the same source of truth.
     static CostWeights defaultCostWeights() { return CostWeights{}; }
     static HardLimits defaultHardLimits() { return HardLimits{}; }
     static ObstacleConstraintConfig defaultObstacleConstraintConfig() { return ObstacleConstraintConfig{}; }
 
+    // Return an obstacle block that effectively disables obstacle constraints by
+    // pushing all runtime spheres far away from the robot workspace.
     static ObstacleParamBlock disabledObstacleParams() {
         ObstacleParamBlock params{};
         params.fill(0.0);
@@ -145,6 +166,11 @@ public:
         return params;
     }
 
+    // =========================================================================
+    // Lifecycle and Runtime Configuration API
+    // =========================================================================
+    // Construction owns the generated capsule and initializes all static solver
+    // data that does not depend on the current target or robot state.
     PandaNMPCController() {
         capsule_ = panda_task_space_nmpc_acados_create_capsule();
         if (capsule_ == nullptr) {
@@ -187,6 +213,7 @@ public:
         setObstacleConstraintConfig(defaultObstacleConstraintConfig());
     }
 
+    // Free the generated acados resources owned by this wrapper.
     ~PandaNMPCController() {
         if (capsule_ != nullptr) {
             panda_task_space_nmpc_acados_free(capsule_);
@@ -195,6 +222,7 @@ public:
         }
     }
 
+    // Update the least-squares weight matrices used by the generated solver.
     void setCostWeights(const CostWeights& weights) {
         cost_weights_ = weights;
         applyCostWeights();
@@ -202,6 +230,7 @@ public:
 
     const CostWeights& getCostWeights() const { return cost_weights_; }
 
+    // Update the hard state and input bounds enforced by the OCP.
     void setHardLimits(const HardLimits& limits) {
         hard_limits_ = limits;
         applyHardLimits();
@@ -209,6 +238,7 @@ public:
 
     const HardLimits& getHardLimits() const { return hard_limits_; }
 
+    // Update the slack penalties used by soft obstacle constraints.
     void setObstacleConstraintConfig(const ObstacleConstraintConfig& config) {
         obstacle_constraint_config_ = sanitizeObstacleConstraintConfig(config);
         applyObstacleConstraintPenalties();
@@ -218,6 +248,11 @@ public:
         return obstacle_constraint_config_;
     }
 
+    // =========================================================================
+    // Solve Entry Points
+    // =========================================================================
+    // All public solve overloads collapse onto the stage-reference API so the
+    // actual acados interaction stays in one implementation.
     NMPCResult NMPCSolveSingleTarget(
         const Vec3& target_pos,
         const Mat3& target_rot,
@@ -244,6 +279,7 @@ public:
         return NMPCSolveStageReferences(stage_refs_buffer_, current_q, current_dq);
     }
 
+    // Convenience overload without runtime obstacle parameters.
     NMPCResult NMPCSolveSingleTarget(
         const Vec3& target_pos,
         const Mat3& target_rot,
@@ -263,6 +299,8 @@ public:
             current_dq);
     }
 
+    // Convenience overload with zero EE twist reference and no runtime
+    // obstacles.
     NMPCResult NMPCSolveSingleTarget(
         const Vec3& target_pos,
         const Mat3& target_rot,
@@ -280,6 +318,7 @@ public:
             current_dq);
     }
 
+    // Canonical solve path for a fully stage-parameterized horizon.
     NMPCResult NMPCSolveStageReferences(
         const std::vector<NMPCStageReference>& stage_refs,
         const Vec7& current_q,
@@ -292,6 +331,7 @@ public:
         result.jerk_cmd.setZero();
         result.status = -1;
 
+        // Reject malformed horizons before touching any acados state.
         if (stage_refs.size() != static_cast<std::size_t>(N_ + 1)) {
             result.status = -100;
             return result;
@@ -300,6 +340,7 @@ public:
         has_last_solve_ = false;
         last_solve_status_ = result.status;
 
+        // Enforce the measured state at stage 0 via lbx == ubx == x0.
         std::array<double, PANDA_TASK_SPACE_NMPC_NX> x0{};
         for (int i = 0; i < 7; ++i) {
             x0[static_cast<std::size_t>(i)] = current_q(i);
@@ -313,6 +354,7 @@ public:
             nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "ubx",
             const_cast<double*>(x0.data()));
 
+        // Push the runtime reference and obstacle parameters into every stage.
         for (int k = 0; k <= N_; ++k) {
             const ParamVector parameters = buildStageParamVector(stage_refs[static_cast<std::size_t>(k)]);
             const int st = panda_task_space_nmpc_acados_update_params(
@@ -323,6 +365,8 @@ public:
             }
         }
 
+        // Warm-start the new solve from the shifted previous iterate whenever
+        // possible to improve runtime consistency.
         resetWarmStart(current_q, current_dq);
 
         result.status = panda_task_space_nmpc_acados_solve(capsule_);
@@ -351,6 +395,7 @@ public:
         return result;
     }
 
+    // Compatibility wrappers kept for older call sites.
     NMPCResult NMPCSolve(
         const Vec3& target_pos,
         const Mat3& target_rot,
@@ -392,8 +437,15 @@ public:
             current_dq);
     }
 
+    // =========================================================================
+    // Solver Introspection
+    // =========================================================================
+    // The ROS node uses this section for timing, residual and slack diagnostics
+    // without having to depend on raw acados symbols.
     double getDt() const { return dt_; }
     int getN() const { return N_; }
+
+    // Gather timing, residual and slack statistics from the most recent solve.
     NMPCSolveDebugInfo collectLastSolveDebugInfo(
         double slack_activation_threshold = 1.0e-6,
         bool include_stage_slack_info = false) {
@@ -466,6 +518,12 @@ public:
     }
 
 private:
+    // =========================================================================
+    // Parameter Layout and Weight-Building Helpers
+    // =========================================================================
+    // The generated solver expects a flat parameter vector. These constants and
+    // helpers define that layout once so the rest of the controller can stay at
+    // the higher "stage reference" level.
     static constexpr std::size_t kParamOffsetQNom = 12;
     static constexpr std::size_t kParamOffsetEeLinVel = 19;
     static constexpr std::size_t kParamOffsetEeAngVel = 22;
@@ -531,6 +589,11 @@ private:
         return result;
     }
 
+    // =========================================================================
+    // Solver Configuration Application
+    // =========================================================================
+    // These methods translate the controller-side structs into the exact arrays
+    // expected by the acados-generated C interface.
     void applyCostWeights() {
         const auto stage_weights = makeDiagonalMatrix(buildStageWeightVector(cost_weights_));
         const auto terminal_weights = makeDiagonalMatrix(buildTerminalWeightVector(cost_weights_));
@@ -638,6 +701,8 @@ private:
         }
     }
 
+    // Pack one high-level stage reference into the generated solver parameter
+    // layout.
     ParamVector buildStageParamVector(const NMPCStageReference& ref) const {
         ParamVector parameters{};
         parameters.fill(0.0);
@@ -665,6 +730,11 @@ private:
         return parameters;
     }
 
+    // =========================================================================
+    // Warm Start and Post-Processing Helpers
+    // =========================================================================
+    // Keeping the warm-start logic here makes the main solve function read more
+    // like a high-level algorithm and less like a sequence of memory copies.
     void resetWarmStart(const Vec7& q, const Vec7& dq) {
         if (!has_warm_start_) {
             initializeWarmStart(q, dq);
@@ -712,6 +782,8 @@ private:
         }
     }
 
+    // Clamp the returned state/input references before handing them to the ROS
+    // node so a transient solver issue never produces an out-of-range command.
     void projectToHardLimits(NMPCResult& result) const {
         for (int i = 0; i < 7; ++i) {
             const std::size_t idx = static_cast<std::size_t>(i);
@@ -722,6 +794,9 @@ private:
         }
     }
 
+    // =========================================================================
+    // acados Handles and Cached Runtime Data
+    // =========================================================================
     panda_task_space_nmpc_solver_capsule* capsule_{nullptr};
     ocp_nlp_config* nlp_config_{nullptr};
     ocp_nlp_dims* nlp_dims_{nullptr};

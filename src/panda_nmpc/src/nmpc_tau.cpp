@@ -31,17 +31,27 @@
 
 class NMPCNode : public rclcpp::Node {
 private:
+    // =========================================================================
+    // Basic Type Aliases
+    // =========================================================================
+    // Keep the frequently used fixed-size types local to the node so the rest of
+    // the implementation can stay compact and consistent.
     using Vec7 = Eigen::Matrix<double, 7, 1>;
     using Vec3 = Eigen::Vector3d;
     using Mat3 = Eigen::Matrix3d;
     using Quat = Eigen::Quaterniond;
     using DynamicSphereArrayMsg = panda_interfaces::msg::DynamicSphereArray;
 
+    // =========================================================================
+    // Parameter and Runtime Configuration Types
+    // =========================================================================
     enum class DynamicObstaclePredictionMode {
         kZeroOrderHold = 0,
         kConstantVelocity,
     };
 
+    // Dynamic obstacle subscription policy shared by the timer loop and the
+    // obstacle callback.
     struct DynamicObstacleConfig {
         bool enabled{false};
         std::string topic{"/dynamic_sphere_obstacles"};
@@ -49,6 +59,7 @@ private:
         double timeout_sec{0.2};
     };
 
+    // Runtime cache for one received moving sphere obstacle.
     struct DynamicSphereState {
         std::string name;
         Vec3 center{Vec3::Zero()};
@@ -56,6 +67,7 @@ private:
         double radius{0.0};
     };
 
+    // Low-frequency acados debug logging policy.
     struct AcadosDebugLogConfig {
         bool enabled{false};
         double period_sec{2.0};
@@ -65,6 +77,7 @@ private:
         int max_reported_stages{4};
     };
 
+    // Minimal input sanitation for externally commanded target poses.
     struct TargetPoseValidationConfig {
         bool enabled{true};
         std::string expected_frame_id{"link0"};
@@ -73,6 +86,8 @@ private:
         double min_quaternion_norm{1.0e-9};
     };
 
+    // Centralized runtime parameter bundle. All ROS parameters are declared once
+    // and then fanned out from here to the controller, SORR and callbacks.
     struct NodeParameters {
         std::string urdf_path;
         std::string obstacle_config_path;
@@ -111,6 +126,9 @@ private:
             PandaNMPCController::defaultObstacleConstraintConfig()};
     };
 
+    // =========================================================================
+    // Core Controller and Regulation Objects
+    // =========================================================================
     PandaNMPCController nmpc_solver_;
     NodeParameters params_;
     NMPCResult last_valid_result_;
@@ -118,6 +136,12 @@ private:
     SecondOrderReferenceRegulator sorr_pos_;
     SecondOrderReferenceRegulator sorr_rot_;
 
+    // =========================================================================
+    // Shared Runtime State
+    // =========================================================================
+    // These fields are updated by subscriptions and consumed by the timer loop.
+    // Access is synchronized via state_mutex_ because the node uses a
+    // MultiThreadedExecutor.
     Vec3 target_pos_{Vec3::Zero()};
     Mat3 target_rot_{Mat3::Identity()};
     Vec7 q_meas_{Vec7::Zero()};
@@ -129,6 +153,9 @@ private:
     bool nominal_initialized_from_state_{false};
     int consecutive_failure_count_{0};
 
+    // =========================================================================
+    // Robot Model and Obstacle State
+    // =========================================================================
     pinocchio::Model pin_model_;
     std::unique_ptr<pinocchio::Data> pin_data_;
     pinocchio::FrameIndex ee_frame_id_{0};
@@ -145,6 +172,9 @@ private:
     rclcpp::Time last_acados_debug_log_stamp_{0, 0, RCL_ROS_TIME};
     mutable std::mutex state_mutex_;
 
+    // =========================================================================
+    // ROS Interfaces
+    // =========================================================================
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_trajectory_sub_;
@@ -155,10 +185,15 @@ private:
     rclcpp::CallbackGroup::SharedPtr state_callback_group_;
     rclcpp::CallbackGroup::SharedPtr dynamic_obstacle_callback_group_;
 
+    // Fixed name ordering used to align ROS joint state messages with the Panda
+    // solver state layout.
     std::array<std::string, 7> ordered_names_{{
         "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"
     }};
 
+    // =========================================================================
+    // Path and Formatting Helpers
+    // =========================================================================
     static std::string defaultPandaUrdfPath() {
         try {
             return ament_index_cpp::get_package_share_directory("panda_ros") + "/model/panda_tau_sim.urdf";
@@ -180,6 +215,8 @@ private:
         return std::vector<double>(values.begin(), values.end());
     }
 
+    // Declare a fixed-length numeric ROS parameter and fail fast if the YAML
+    // shape does not match the expected solver dimension.
     template <std::size_t N>
     std::array<double, N> declareFixedSizeArrayParameter(
         const std::string& param_name,
@@ -204,6 +241,8 @@ private:
         return result;
     }
 
+    // Parse the stage-wise obstacle prediction policy once at startup so the
+    // timer loop only needs a cheap enum branch.
     static DynamicObstaclePredictionMode parseDynamicObstaclePredictionMode(const std::string& value) {
         if (value == "constant_velocity") {
             return DynamicObstaclePredictionMode::kConstantVelocity;
@@ -216,6 +255,52 @@ private:
             "'. Use 'constant_velocity' or 'zero_order_hold'.");
     }
 
+    // Render debug scalars in a stable way so acados logs remain readable even
+    // when values span multiple orders of magnitude.
+    static std::string formatDebugFloat(const double value) {
+        if (!std::isfinite(value)) {
+            return "nan";
+        }
+
+        std::ostringstream stream;
+        const double abs_value = std::abs(value);
+        if ((abs_value > 0.0 && abs_value < 1.0e-3) || abs_value >= 1.0e4) {
+            stream << std::scientific << std::setprecision(4) << value;
+        } else {
+            stream << std::fixed << std::setprecision(4) << value;
+        }
+        return stream.str();
+    }
+
+    static void appendDebugLine(
+        std::ostringstream& stream,
+        const std::string& label,
+        const std::string& value) {
+        constexpr int kLabelWidth = 38;
+        stream << "| " << std::left << std::setw(kLabelWidth) << label
+               << " : " << value << '\n';
+    }
+
+    static void appendDebugLine(
+        std::ostringstream& stream,
+        const std::string& label,
+        const double value) {
+        appendDebugLine(stream, label, formatDebugFloat(value));
+    }
+
+    static void appendDebugLine(
+        std::ostringstream& stream,
+        const std::string& label,
+        const int value) {
+        appendDebugLine(stream, label, std::to_string(value));
+    }
+
+    // =========================================================================
+    // Parameter Declaration and Startup Configuration
+    // =========================================================================
+    // This is the single place where ROS parameters are declared. Keeping that
+    // work centralized makes it much easier to audit how YAML flows into the
+    // controller and the runtime node state.
     void declareStartupParameters() {
         params_.urdf_path = this->declare_parameter<std::string>("urdf_path", defaultPandaUrdfPath());
         params_.obstacle_config_path =
@@ -378,6 +463,8 @@ private:
         q_nominal_ = toEigen(declareFixedSizeArrayParameter("nominal_posture.q", default_q_nominal));
     }
 
+    // Prefer the explicit obstacle XML if it exists; otherwise fall back to the
+    // MuJoCo scene XML so one launch file can still boot with minimal setup.
     std::string selectObstacleSourcePath() const {
         if (!params_.obstacle_config_path.empty() &&
             std::ifstream(params_.obstacle_config_path).good()) {
@@ -386,6 +473,11 @@ private:
         return params_.scene_xml_path;
     }
 
+    // =========================================================================
+    // Robot Model Initialization and Static Obstacle Loading
+    // =========================================================================
+    // Everything here runs once during construction and produces immutable
+    // resources that the timer loop later reuses.
     void loadStaticObstacles() {
         static_obstacle_params_ = PandaNMPCController::disabledObstacleParams();
         static_obstacle_slot_count_ = 0;
@@ -440,6 +532,8 @@ private:
         RCLCPP_INFO(this->get_logger(), "%s", stream.str().c_str());
     }
 
+    // Build the Pinocchio model once and cache the EE frame id so later FK
+    // queries only need lightweight data updates.
     void initializePinocchio() {
         pinocchio::urdf::buildModel(params_.urdf_path, pin_model_);
         pin_data_ = std::make_unique<pinocchio::Data>(pin_model_);
@@ -450,6 +544,11 @@ private:
         ee_frame_id_ = pin_model_.getFrameId(params_.ee_frame_name);
     }
 
+    // =========================================================================
+    // SORR and Kinematics Utilities
+    // =========================================================================
+    // These helpers keep all target filtering and current-EE-state estimation in
+    // one place, separate from the solver orchestration logic.
     void setSorrConfig() {
         SecondOrderReferenceRegulator::Config pos_config;
         pos_config.dt = nmpc_solver_.getDt();
@@ -468,6 +567,7 @@ private:
         sorr_rot_.setConfig(rot_config);
     }
 
+    // Compute the current end-effector pose from the latest joint measurement.
     void computeCurrentEePose(Vec3& ee_pos, Mat3& ee_rot) {
         pinocchio::forwardKinematics(pin_model_, *pin_data_, q_meas_);
         pinocchio::updateFramePlacements(pin_model_, *pin_data_);
@@ -476,6 +576,8 @@ private:
         ee_rot = transform.rotation();
     }
 
+    // Seed the second-order reference regulators from the measured EE pose so
+    // the first control cycle does not see an artificial target step.
     void initializeSorrFromCurrentEePose() {
         Vec3 ee_pos = Vec3::Zero();
         Mat3 ee_rot = Mat3::Identity();
@@ -486,6 +588,11 @@ private:
         RCLCPP_INFO(this->get_logger(), "SORR initialized from current EE pose.");
     }
 
+    // =========================================================================
+    // Obstacle Projection and Reference Assembly
+    // =========================================================================
+    // The timer loop asks this block to build stage-wise references and obstacle
+    // parameters without having to care about XML-vs-topic details.
     bool hasFreshDynamicObstacles(
         const rclcpp::Time& dynamic_obstacle_stamp,
         bool dynamic_obstacles_ready) const {
@@ -495,6 +602,8 @@ private:
         return (this->now() - dynamic_obstacle_stamp).seconds() <= params_.dynamic_obstacles.timeout_sec;
     }
 
+    // Merge static obstacle slots with predicted dynamic obstacle slots for one
+    // horizon stage.
     PandaNMPCController::ObstacleParamBlock buildObstacleParamsForStage(
         const int stage,
         const std::vector<DynamicSphereState>& dynamic_obstacles,
@@ -526,6 +635,8 @@ private:
         return params;
     }
 
+    // Build a horizon of single-target references. Every stage shares the same
+    // filtered task-space target, while obstacle parameters can vary by stage.
     const std::vector<NMPCStageReference>& buildSingleTargetStageReferences(
         const Vec3& filtered_target_pos,
         const Mat3& filtered_target_rot,
@@ -557,6 +668,11 @@ private:
         return stage_refs_buffer_;
     }
 
+    // =========================================================================
+    // Debug Reporting
+    // =========================================================================
+    // acados introspection is intentionally kept out of the control logic so the
+    // main timer path stays easy to read.
     bool shouldLogAcadosDebug(const int solve_status) const {
         const bool periodic_logging_enabled = params_.acados_debug.enabled;
         const bool failure_logging_enabled =
@@ -588,38 +704,46 @@ private:
         last_acados_debug_log_stamp_ = this->now();
 
         std::ostringstream stream;
-        stream << std::fixed << std::setprecision(4);
-        stream << "Acados debug: status=" << debug_info.solver_status
-               << ", sqp_iter=" << debug_info.sqp_iter
-               << ", qp_status=";
-        if (debug_info.qp_status_available) {
-            stream << debug_info.qp_status;
-        } else {
-            stream << "n/a";
-        }
-        stream
-               << ", qp_iter=" << debug_info.qp_iter
-               << ", cost=";
-        if (std::isfinite(debug_info.cost_value)) {
-            stream << debug_info.cost_value;
-        } else {
-            stream << "nan";
-        }
-        stream << ", residuals=[stat=" << debug_info.res_stat
-               << ", eq=" << debug_info.res_eq
-               << ", ineq=" << debug_info.res_ineq
-               << ", comp=" << debug_info.res_comp
-               << "], time_ms=[tot=" << (1.0e3 * debug_info.time_tot)
-               << ", lin=" << (1.0e3 * debug_info.time_lin)
-               << ", qp=" << (1.0e3 * debug_info.time_qp)
-               << "], soft=[active=" << debug_info.active_slack_count
-               << "/" << debug_info.total_slack_constraints
-               << ", stages=" << debug_info.active_stage_count
-               << "/" << (nmpc_solver_.getN() + 1)
-               << ", max=" << debug_info.max_slack
-               << ", sum=" << debug_info.sum_slack
-               << ", threshold=" << params_.acados_debug.slack_activation_threshold
-               << "]";
+        const std::string divider =
+            "======================================================================";
+        const std::string subsection_divider =
+            "----------------------------------------------------------------------";
+        const int solver_status = debug_info.solver_status;
+
+        stream << divider << '\n';
+        stream << "ACADOS NMPC DEBUG REPORT\n";
+        stream << subsection_divider << '\n';
+        appendDebugLine(stream, "Nonlinear Solver Status", solver_status);
+        appendDebugLine(stream, "Sequential Quadratic Programming Iterations", debug_info.sqp_iter);
+        appendDebugLine(
+            stream,
+            "Quadratic Program Solver Status",
+            debug_info.qp_status_available ? std::to_string(debug_info.qp_status) : "not available");
+        appendDebugLine(stream, "Quadratic Program Iterations", debug_info.qp_iter);
+        appendDebugLine(stream, "Objective Cost Value", debug_info.cost_value);
+        appendDebugLine(stream, "Stationarity Residual", debug_info.res_stat);
+        appendDebugLine(stream, "Dynamics Equality Residual", debug_info.res_eq);
+        appendDebugLine(stream, "Inequality Residual", debug_info.res_ineq);
+        appendDebugLine(stream, "Complementarity Residual", debug_info.res_comp);
+        appendDebugLine(stream, "Total Solver Time [ms]", 1.0e3 * debug_info.time_tot);
+        appendDebugLine(stream, "Linearization Time [ms]", 1.0e3 * debug_info.time_lin);
+        appendDebugLine(stream, "Quadratic Program Time [ms]", 1.0e3 * debug_info.time_qp);
+        appendDebugLine(
+            stream,
+            "Active Soft Constraint Count",
+            std::to_string(debug_info.active_slack_count) + " / " +
+                std::to_string(debug_info.total_slack_constraints));
+        appendDebugLine(
+            stream,
+            "Stages With Soft Constraint Activity",
+            std::to_string(debug_info.active_stage_count) + " / " +
+                std::to_string(nmpc_solver_.getN() + 1));
+        appendDebugLine(stream, "Maximum Soft Constraint Violation", debug_info.max_slack);
+        appendDebugLine(stream, "Accumulated Soft Constraint Violation", debug_info.sum_slack);
+        appendDebugLine(
+            stream,
+            "Soft Constraint Activation Threshold",
+            params_.acados_debug.slack_activation_threshold);
 
         if (params_.acados_debug.include_stage_slack_summary &&
             !debug_info.stage_slack_info.empty()) {
@@ -634,38 +758,45 @@ private:
                     return lhs.stage < rhs.stage;
                 });
 
+            stream << subsection_divider << '\n';
+            stream << "Soft Constraint Stage Summary\n";
             int reported_stage_count = 0;
-            stream << ", top_soft_stages=";
             for (const auto& stage_info : stage_slack_info) {
                 if (stage_info.max_slack <= params_.acados_debug.slack_activation_threshold &&
                     stage_info.active_count == 0) {
                     continue;
                 }
-                if (reported_stage_count > 0) {
-                    stream << "; ";
-                }
-                stream << "k=" << stage_info.stage
-                       << " max=" << stage_info.max_slack
-                       << " sum=" << stage_info.sum_slack
-                       << " active=" << stage_info.active_count
-                       << "/" << stage_info.slack_dim;
+                appendDebugLine(
+                    stream,
+                    "Prediction Stage " + std::to_string(stage_info.stage),
+                    "maximum_violation=" + formatDebugFloat(stage_info.max_slack) +
+                        ", accumulated_violation=" + formatDebugFloat(stage_info.sum_slack) +
+                        ", active_constraints=" + std::to_string(stage_info.active_count) +
+                        " / " + std::to_string(stage_info.slack_dim));
                 ++reported_stage_count;
                 if (reported_stage_count >= params_.acados_debug.max_reported_stages) {
                     break;
                 }
             }
             if (reported_stage_count == 0) {
-                stream << "none";
+                appendDebugLine(stream, "Soft Constraint Stage Summary", "no active stage exceeded the threshold");
             }
         }
 
-        if (solve_status == 0) {
+        stream << divider;
+
+        if (solver_status == 0) {
             RCLCPP_INFO(this->get_logger(), "%s", stream.str().c_str());
         } else {
             RCLCPP_WARN(this->get_logger(), "%s", stream.str().c_str());
         }
     }
 
+    // =========================================================================
+    // Result Publication and Main Control Loop
+    // =========================================================================
+    // These helpers form the real-time path: assemble data, solve NMPC, publish
+    // the result and fall back to the last safe command when needed.
     void publishResult(const NMPCResult& result) {
         panda_interfaces::msg::ResultNMPC msg;
         Eigen::Map<Vec7>(msg.q_ref.data()) = result.q_ref;
@@ -686,6 +817,8 @@ private:
         return result;
     }
 
+    // Snapshot shared state, solve the current NMPC problem and handle failure
+    // recovery in a bounded, easy-to-follow sequence.
     void timerCallback() {
         Vec3 target_pos = Vec3::Zero();
         Mat3 target_rot = Mat3::Identity();
@@ -764,6 +897,11 @@ private:
         publishResult(buildSafeHoldResult(q_meas));
     }
 
+    // =========================================================================
+    // ROS Topic Callbacks
+    // =========================================================================
+    // All subscriptions feed the shared runtime state here. Each callback keeps
+    // its validation local before touching the shared cache.
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg) {
         if (msg->position.size() < ordered_names_.size()) {
             RCLCPP_ERROR_THROTTLE(
@@ -810,6 +948,8 @@ private:
         }
     }
 
+    // Accept a new target pose only after lightweight sanity checks so a bad UI
+    // message cannot poison the controller state.
     void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         const Vec3 position(
             msg->pose.position.x,
@@ -883,6 +1023,8 @@ private:
         target_rot_ = quat.normalized().toRotationMatrix();
     }
 
+    // Cache the latest moving obstacles so the timer loop can do stage-wise
+    // prediction without any ROS work in the hot path.
     void dynamicObstacleCallback(const DynamicSphereArrayMsg::SharedPtr msg) {
         std::vector<DynamicSphereState> dynamic_obstacles;
         rclcpp::Time dynamic_obstacle_stamp(0, 0, RCL_ROS_TIME);
@@ -943,19 +1085,21 @@ private:
             dynamic_obstacles_ready_ = !dynamic_obstacles_.empty();
         }
 
-        std::ostringstream stream;
-        stream << "Updated " << dynamic_obstacles.size()
-               << " dynamic obstacle(s); static obstacles keep the first "
-               << static_obstacle_slot_count_ << " slot(s)";
-        if (dynamic_prediction_mode_ == DynamicObstaclePredictionMode::kConstantVelocity) {
-            stream << " using constant-velocity prediction.";
-        } else {
-            stream << " using zero-order-hold prediction.";
-        }
-        RCLCPP_INFO_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000, "%s", stream.str().c_str());
+        // std::ostringstream stream;
+        // stream << "Updated " << dynamic_obstacles.size()
+        //        << " dynamic obstacle(s); static obstacles keep the first "
+        //        << static_obstacle_slot_count_ << " slot(s)";
+        // if (dynamic_prediction_mode_ == DynamicObstaclePredictionMode::kConstantVelocity) {
+        //     stream << " using constant-velocity prediction.";
+        // } else {
+        //     stream << " using zero-order-hold prediction.";
+        // }
+        // RCLCPP_INFO_THROTTLE(
+        //     this->get_logger(), *this->get_clock(), 2000, "%s", stream.str().c_str());
     }
 
+    // The node keeps this subscription only for interface compatibility. The
+    // current implementation is intentionally single-target only.
     void jointTrajectoryCallback(const trajectory_msgs::msg::JointTrajectory::SharedPtr /*msg*/) {
         RCLCPP_WARN_THROTTLE(
             this->get_logger(), *this->get_clock(), 2000,
@@ -963,9 +1107,16 @@ private:
     }
 
 public:
+    // =========================================================================
+    // Node Construction
+    // =========================================================================
+    // The constructor wires together parameters, robot model, controller
+    // settings and ROS interfaces. No NMPC logic should leak into this section.
     NMPCNode() : Node("nmpc_tau_node") {
+        // 1) Pull all runtime configuration from ROS parameters.
         declareStartupParameters();
 
+        // 2) Push configuration into the acados wrapper before any solve call.
         nmpc_solver_.setCostWeights(params_.cost_weights);
         nmpc_solver_.setHardLimits(params_.hard_limits);
         nmpc_solver_.setObstacleConstraintConfig(params_.obstacle_constraint);
@@ -973,17 +1124,21 @@ public:
         target_pos_ = params_.target_pos;
         target_rot_ = params_.target_rot;
 
+        // 3) Initialize model-side resources and reusable reference buffers.
         initializePinocchio();
         loadStaticObstacles();
         setSorrConfig();
         stage_refs_buffer_.resize(static_cast<std::size_t>(nmpc_solver_.getN() + 1));
 
+        // 4) Prepare a conservative default output until the first successful solve.
         last_valid_result_.status = -1;
         last_valid_result_.q_ref = q_nominal_;
         last_valid_result_.v_ref.setZero();
         last_valid_result_.a_ref.setZero();
         last_valid_result_.jerk_cmd.setZero();
 
+        // 5) Separate callbacks into groups so subscriptions stay responsive
+        // while the control timer is solving.
         timer_callback_group_ =
             this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         state_callback_group_ =
@@ -1018,6 +1173,7 @@ public:
                 dynamic_obstacle_sub_options);
         }
 
+        // 6) Start the output publisher and fixed-rate control timer.
         nmpc_res_pub_ =
             this->create_publisher<panda_interfaces::msg::ResultNMPC>(params_.nmpc_result_topic, 1);
         timer_ = this->create_wall_timer(
@@ -1043,6 +1199,11 @@ public:
     }
 };
 
+// ============================================================================
+// Program Entry Point
+// ============================================================================
+// Use a MultiThreadedExecutor so the timer callback does not block state and
+// obstacle subscriptions.
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<NMPCNode>();
