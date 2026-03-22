@@ -424,7 +424,16 @@ def build_default_runtime_parameters(scene_obstacles: list[StaticSphereObstacle]
     parameter_values[3:12] = np.eye(3, dtype=float).reshape(-1, order="F")
     parameter_values[19:25] = 0.0
 
+    for obstacle_idx in range(cfg.obstacle.num_obstacles):
+        offset = cfg.base_np_stage + 4 * obstacle_idx
+        parameter_values[offset + 0] = 1000.0
+        parameter_values[offset + 1] = 1000.0
+        parameter_values[offset + 2] = 1000.0
+        parameter_values[offset + 3] = 0.0
+
     for obstacle_idx, obstacle in enumerate(scene_obstacles):
+        if obstacle_idx >= cfg.obstacle.num_obstacles:
+            break
         offset = cfg.base_np_stage + 4 * obstacle_idx
         parameter_values[offset:offset + 3] = obstacle.center
         parameter_values[offset + 3] = obstacle.radius
@@ -452,10 +461,10 @@ def build_acados_ocp(
         raise ValueError("No robot spheres found in URDF visual geometry.")
     if not scene_obstacles:
         raise ValueError("No static sphere obstacles found in obstacle config.")
-    if cfg.obstacle.num_obstacles != len(scene_obstacles):
+    if cfg.obstacle.num_obstacles < len(scene_obstacles):
         raise ValueError(
-            "cfg.obstacle.num_obstacles does not match parsed obstacle count: "
-            f"{cfg.obstacle.num_obstacles} != {len(scene_obstacles)}"
+            "cfg.obstacle.num_obstacles is smaller than parsed static obstacle count: "
+            f"{cfg.obstacle.num_obstacles} < {len(scene_obstacles)}"
         )
 
     model, nh = build_symbolic_model(pin_model, ee_frame_id, robot_spheres, scene_obstacles, cfg)
@@ -502,10 +511,19 @@ def main() -> None:
     parser.add_argument("--json-file", type=str, default="panda_task_space_nmpc.json", help="JSON file name")
     parser.add_argument("--code-export-dir", type=str, default="c_generated_code", help="Export directory")
     parser.add_argument("--safety-margin", type=float, default=0.05, help="Obstacle safety margin")
+    parser.add_argument(
+        "--runtime-obstacle-slots",
+        type=int,
+        default=None,
+        help="Number of obstacle parameter slots compiled into the solver. Defaults to the static obstacle count.",
+    )
     args = parser.parse_args()
 
     obstacle_source_path = resolve_obstacle_source_path(args.scene_xml, args.obstacle_config)
     scene_obstacles = load_static_sphere_obstacles(obstacle_source_path)
+    runtime_obstacle_slots = len(scene_obstacles) if args.runtime_obstacle_slots is None else args.runtime_obstacle_slots
+    if runtime_obstacle_slots <= 0:
+        raise ValueError("--runtime-obstacle-slots must be positive.")
 
     cfg = OcpConfig(
         dt=args.dt,
@@ -514,7 +532,7 @@ def main() -> None:
         json_file=args.json_file,
         code_export_dir=args.code_export_dir,
         obstacle=ObstacleConstraintConfig(
-            num_obstacles=len(scene_obstacles),
+            num_obstacles=runtime_obstacle_slots,
             safety_margin=args.safety_margin,
         ),
     )
@@ -541,7 +559,10 @@ def main() -> None:
         "Parameter layout: p_ref(3) + R_ref(9) + q_nom(7) + ee_lin_vel_ref(3) + ee_ang_vel_ref(3) "
         f"+ obstacle_xyzr(4) * {cfg.obstacle.num_obstacles}"
     )
-    print(f"Robot spheres: {len(robot_spheres)}, static obstacles: {len(loaded_obstacles)}")
+    print(
+        f"Robot spheres: {len(robot_spheres)}, static obstacles: {len(loaded_obstacles)}, "
+        f"runtime obstacle slots: {cfg.obstacle.num_obstacles}"
+    )
 
     AcadosOcpSolver(ocp, json_file=cfg.json_file)
     print("Generation complete.")

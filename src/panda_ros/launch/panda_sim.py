@@ -43,6 +43,7 @@ import subprocess
 from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
+from launch.conditions import IfCondition
 from launch.substitutions import (
     Command,
     FindExecutable,
@@ -59,6 +60,8 @@ def launch_setup(context, *args, **kwargs):
 
     obstacle_config_path = LaunchConfiguration("obstacle_config_path").perform(context)
     scene_xml_path = LaunchConfiguration("scene_xml_path").perform(context)
+    dynamic_obstacle_topic = LaunchConfiguration("dynamic_obstacle_topic")
+    dynamic_obstacle_publisher_params_file = LaunchConfiguration("dynamic_obstacle_publisher_params_file")
     sync_executable = os.path.join(
         get_package_prefix("panda_nmpc"),
         "lib",
@@ -126,11 +129,39 @@ def launch_setup(context, *args, **kwargs):
             parameters=[
                 {"use_sim_time": True},
                 ParameterFile(parameters_file),
+                {
+                    "mujoco_plugins.dynamic_sphere_visualization.type":
+                        "mujoco_ros2_control_plugins/DynamicSphereVisualizationPlugin",
+                    "mujoco_plugins.dynamic_sphere_visualization.topic": dynamic_obstacle_topic,
+                    "mujoco_plugins.dynamic_sphere_visualization.max_spheres": 8,
+                    "mujoco_plugins.dynamic_sphere_visualization.timeout_sec": 0.25,
+                    "mujoco_plugins.dynamic_sphere_visualization.hidden_z": -5.0,
+                    "mujoco_plugins.dynamic_sphere_visualization.body_name_prefix":
+                        "dynamic_obstacle_mocap_",
+                    "mujoco_plugins.dynamic_sphere_visualization.geom_name_prefix":
+                        "dynamic_obstacle_geom_",
+                },
             ],
             remappings=(
                 [("~/robot_description", "/robot_description")] if os.environ.get("ROS_DISTRO") == "humble" else []
             ),
             on_exit=Shutdown(),
+        )
+    )
+
+    nodes.append(
+        Node(
+            package="panda_nmpc",
+            executable="dynamic_sphere_obstacle_publisher",
+            output="both",
+            parameters=[
+                ParameterFile(dynamic_obstacle_publisher_params_file, allow_substs=True),
+                {
+                    "use_sim_time": True,
+                    "topic": dynamic_obstacle_topic,
+                },
+            ],
+            condition=IfCondition(LaunchConfiguration("start_dynamic_obstacle_publisher")),
         )
     )
 
@@ -161,6 +192,23 @@ def generate_launch_description():
         default_value="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
         description="Canonical static sphere obstacle config shared by MuJoCo, MoveIt and acados",
     )
+    dynamic_obstacle_topic = DeclareLaunchArgument(
+        "dynamic_obstacle_topic",
+        default_value="/dynamic_sphere_obstacles",
+        description="Shared dynamic sphere topic used by NMPC and MuJoCo visualization.",
+    )
+    start_dynamic_obstacle_publisher = DeclareLaunchArgument(
+        "start_dynamic_obstacle_publisher",
+        default_value="false",
+        description="Start the demo dynamic sphere obstacle publisher together with MuJoCo simulation.",
+    )
+    dynamic_obstacle_publisher_params_file = DeclareLaunchArgument(
+        "dynamic_obstacle_publisher_params_file",
+        default_value=PathJoinSubstitution(
+            [FindPackageShare("panda_nmpc"), "config", "dynamic_sphere_obstacle_publisher.yaml"]
+        ),
+        description="Parameter file for the demo dynamic sphere obstacle publisher.",
+    )
     scene_xml_path = DeclareLaunchArgument(
         "scene_xml_path",
         default_value="/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml",
@@ -171,6 +219,9 @@ def generate_launch_description():
         [
             headless,
             obstacle_config_path,
+            dynamic_obstacle_topic,
+            start_dynamic_obstacle_publisher,
+            dynamic_obstacle_publisher_params_file,
             scene_xml_path,
             OpaqueFunction(function=launch_setup),
         ]

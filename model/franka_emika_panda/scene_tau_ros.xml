@@ -36,17 +36,52 @@
     <!-- BEGIN AUTO-GENERATED STATIC SPHERE OBSTACLES -->
     <!-- Source of truth: /home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml -->
     <body name="obs1" pos="0.4 -0.1 0.35">
-      <geom type="sphere" size="0.1" rgba="1 0 0 1"
+      <geom type="sphere" size="0.05" rgba="1 0 0 1"
             mass="0"
             contype="1" conaffinity="1"/>
     </body>
 
     <body name="obs2" pos="0.4 0.1 0.35">
-      <geom type="sphere" size="0.1" rgba="0 1 0 1"
+      <geom type="sphere" size="0.05" rgba="0 1 0 1"
             mass="0"
             contype="1" conaffinity="1"/>
     </body>
     <!-- END AUTO-GENERATED STATIC SPHERE OBSTACLES -->
+
+    <!-- Dynamic obstacle visualization slots.
+         These spheres are driven at runtime by the MuJoCo dynamic obstacle visualization plugin. -->
+    <body mocap="true" name="dynamic_obstacle_mocap_0" pos="-2.0 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_0" type="sphere" size="0.05" rgba="1 0.45 0 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_1" pos="-2.25 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_1" type="sphere" size="0.05" rgba="0 0.75 1 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_2" pos="-2.5 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_2" type="sphere" size="0.05" rgba="1 0.2 0.7 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_3" pos="-2.75 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_3" type="sphere" size="0.05" rgba="1 0.9 0.1 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_4" pos="-3.0 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_4" type="sphere" size="0.05" rgba="0.2 1 0.4 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_5" pos="-3.25 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_5" type="sphere" size="0.05" rgba="0.7 0.6 1 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_6" pos="-3.5 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_6" type="sphere" size="0.05" rgba="1 0.55 0.35 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
+    <body mocap="true" name="dynamic_obstacle_mocap_7" pos="-3.75 0.0 -5.0">
+      <geom name="dynamic_obstacle_geom_7" type="sphere" size="0.05" rgba="0.3 0.9 0.9 0.45"
+            mass="0" contype="0" conaffinity="0"/>
+    </body>
 
   </worldbody>
 

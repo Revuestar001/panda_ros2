@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <exception>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -17,9 +17,11 @@
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
+#include "panda_interfaces/msg/dynamic_sphere_array.hpp"
 #include "panda_interfaces/msg/result_nmpc.hpp"
 #include "panda_nmpc_controller.hpp"
 #include "second_order_reference_regulator.hpp"
@@ -31,6 +33,26 @@ private:
     using Vec3 = Eigen::Vector3d;
     using Mat3 = Eigen::Matrix3d;
     using Quat = Eigen::Quaterniond;
+    using DynamicSphereArrayMsg = panda_interfaces::msg::DynamicSphereArray;
+
+    enum class DynamicObstaclePredictionMode {
+        kZeroOrderHold = 0,
+        kConstantVelocity,
+    };
+
+    struct DynamicObstacleConfig {
+        bool enabled{false};
+        std::string topic{"/dynamic_sphere_obstacles"};
+        std::string prediction_mode{"constant_velocity"};
+        double timeout_sec{0.2};
+    };
+
+    struct DynamicSphereState {
+        std::string name;
+        Vec3 center{Vec3::Zero()};
+        Vec3 velocity{Vec3::Zero()};
+        double radius{0.0};
+    };
 
     struct NodeParameters {
         std::string urdf_path;
@@ -59,6 +81,8 @@ private:
         double sorr_rot_natural_frequency{10.0};
         double sorr_rot_max_angular_velocity{0.07845};
         double sorr_rot_max_angular_acceleration{0.7845};
+
+        DynamicObstacleConfig dynamic_obstacles{};
 
         PandaNMPCController::CostWeights cost_weights{PandaNMPCController::defaultCostWeights()};
         PandaNMPCController::HardLimits hard_limits{PandaNMPCController::defaultHardLimits()};
@@ -89,14 +113,25 @@ private:
     pinocchio::FrameIndex ee_frame_id_{0};
 
     std::vector<panda_nmpc::StaticSphereObstacle> scene_obstacles_;
-    PandaNMPCController::ObstacleParamBlock runtime_obstacle_params_{
+    PandaNMPCController::ObstacleParamBlock static_obstacle_params_{
         PandaNMPCController::disabledObstacleParams()};
+    std::size_t static_obstacle_slot_count_{0};
+    std::vector<DynamicSphereState> dynamic_obstacles_;
+    rclcpp::Time dynamic_obstacle_stamp_{0, 0, RCL_ROS_TIME};
+    bool dynamic_obstacles_ready_{false};
+    DynamicObstaclePredictionMode dynamic_prediction_mode_{DynamicObstaclePredictionMode::kConstantVelocity};
+    std::vector<NMPCStageReference> stage_refs_buffer_;
+    mutable std::mutex state_mutex_;
 
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_trajectory_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_sub_;
+    rclcpp::Subscription<DynamicSphereArrayMsg>::SharedPtr dynamic_obstacle_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::CallbackGroup::SharedPtr timer_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr state_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr dynamic_obstacle_callback_group_;
 
     std::array<std::string, 7> ordered_names_{{
         "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"
@@ -145,6 +180,18 @@ private:
             result(i) = values[static_cast<std::size_t>(i)];
         }
         return result;
+    }
+
+    static DynamicObstaclePredictionMode parseDynamicObstaclePredictionMode(const std::string& value) {
+        if (value == "constant_velocity") {
+            return DynamicObstaclePredictionMode::kConstantVelocity;
+        }
+        if (value == "zero_order_hold" || value == "zoh") {
+            return DynamicObstaclePredictionMode::kZeroOrderHold;
+        }
+        throw std::runtime_error(
+            "Unsupported dynamic obstacle prediction mode '" + value +
+            "'. Use 'constant_velocity' or 'zero_order_hold'.");
     }
 
     void declareStartupParameters() {
@@ -201,6 +248,19 @@ private:
             this->declare_parameter<double>("sorr_rot_max_angular_velocity", params_.sorr_rot_max_angular_velocity);
         params_.sorr_rot_max_angular_acceleration =
             this->declare_parameter<double>("sorr_rot_max_angular_acceleration", params_.sorr_rot_max_angular_acceleration);
+
+        params_.dynamic_obstacles.enabled =
+            this->declare_parameter<bool>("dynamic_obstacles.enabled", params_.dynamic_obstacles.enabled);
+        params_.dynamic_obstacles.topic =
+            this->declare_parameter<std::string>("dynamic_obstacles.topic", params_.dynamic_obstacles.topic);
+        params_.dynamic_obstacles.prediction_mode =
+            this->declare_parameter<std::string>(
+                "dynamic_obstacles.prediction_mode", params_.dynamic_obstacles.prediction_mode);
+        params_.dynamic_obstacles.timeout_sec = std::max(
+            1.0e-3,
+            this->declare_parameter<double>("dynamic_obstacles.timeout_sec", params_.dynamic_obstacles.timeout_sec));
+        dynamic_prediction_mode_ =
+            parseDynamicObstaclePredictionMode(params_.dynamic_obstacles.prediction_mode);
 
         const auto default_weights = PandaNMPCController::defaultCostWeights();
         params_.cost_weights.pos = declareFixedSizeArrayParameter("nmpc_weights.stage.pos", default_weights.pos);
@@ -267,14 +327,15 @@ private:
     }
 
     void loadStaticObstacles() {
-        runtime_obstacle_params_ = PandaNMPCController::disabledObstacleParams();
+        static_obstacle_params_ = PandaNMPCController::disabledObstacleParams();
+        static_obstacle_slot_count_ = 0;
         const std::string obstacle_source_path = selectObstacleSourcePath();
         scene_obstacles_ = panda_nmpc::loadStaticSphereObstaclesFromSceneXml(obstacle_source_path);
 
         if (scene_obstacles_.empty()) {
             RCLCPP_WARN(
                 this->get_logger(),
-                "No static sphere obstacles found in '%s'. Obstacle constraints are disabled.",
+                "No static sphere obstacles found in '%s'. Obstacle constraints are disabled until runtime data arrives.",
                 obstacle_source_path.c_str());
             return;
         }
@@ -282,26 +343,29 @@ private:
         if (scene_obstacles_.size() > PandaNMPCController::kNumRuntimeObstacles) {
             RCLCPP_WARN(
                 this->get_logger(),
-                "Obstacle config defines %zu obstacle(s) but the solver supports %zu. Extra obstacles will be ignored.",
+                "Obstacle config defines %zu obstacle(s) but solver only supports %zu. Extra obstacles will be ignored.",
                 scene_obstacles_.size(),
                 PandaNMPCController::kNumRuntimeObstacles);
         }
 
         const std::size_t obstacle_count =
             std::min(scene_obstacles_.size(), PandaNMPCController::kNumRuntimeObstacles);
+        static_obstacle_slot_count_ = obstacle_count;
         for (std::size_t obstacle_idx = 0; obstacle_idx < obstacle_count; ++obstacle_idx) {
             const auto& obstacle = scene_obstacles_[obstacle_idx];
             const std::size_t offset = obstacle_idx * 4;
-            runtime_obstacle_params_[offset + 0] = obstacle.center.x();
-            runtime_obstacle_params_[offset + 1] = obstacle.center.y();
-            runtime_obstacle_params_[offset + 2] = obstacle.center.z();
-            runtime_obstacle_params_[offset + 3] = obstacle.radius;
+            static_obstacle_params_[offset + 0] = obstacle.center.x();
+            static_obstacle_params_[offset + 1] = obstacle.center.y();
+            static_obstacle_params_[offset + 2] = obstacle.center.z();
+            static_obstacle_params_[offset + 3] = obstacle.radius;
         }
 
         std::ostringstream stream;
         stream << "Loaded " << scene_obstacles_.size()
-               << " obstacle(s) from '" << obstacle_source_path
-               << "'. Applied " << obstacle_count << " obstacle(s): ";
+               << " static obstacle(s) from '" << obstacle_source_path
+               << "'. Applied " << obstacle_count << " slot(s), reserved "
+               << (PandaNMPCController::kNumRuntimeObstacles - static_obstacle_slot_count_)
+               << " slot(s) for dynamic obstacles: ";
         for (std::size_t obstacle_idx = 0; obstacle_idx < obstacle_count; ++obstacle_idx) {
             const auto& obstacle = scene_obstacles_[obstacle_idx];
             if (obstacle_idx > 0) {
@@ -362,6 +426,77 @@ private:
         RCLCPP_INFO(this->get_logger(), "SORR initialized from current EE pose.");
     }
 
+    bool hasFreshDynamicObstacles(
+        const rclcpp::Time& dynamic_obstacle_stamp,
+        bool dynamic_obstacles_ready) const {
+        if (!params_.dynamic_obstacles.enabled || !dynamic_obstacles_ready) {
+            return false;
+        }
+        return (this->now() - dynamic_obstacle_stamp).seconds() <= params_.dynamic_obstacles.timeout_sec;
+    }
+
+    PandaNMPCController::ObstacleParamBlock buildObstacleParamsForStage(
+        const int stage,
+        const std::vector<DynamicSphereState>& dynamic_obstacles,
+        bool dynamic_obstacles_ready,
+        const rclcpp::Time& dynamic_obstacle_stamp) const {
+        PandaNMPCController::ObstacleParamBlock params = static_obstacle_params_;
+        if (!hasFreshDynamicObstacles(dynamic_obstacle_stamp, dynamic_obstacles_ready)) {
+            return params;
+        }
+
+        const double prediction_time = static_cast<double>(stage) * nmpc_solver_.getDt();
+        const std::size_t dynamic_slot_count =
+            PandaNMPCController::kNumRuntimeObstacles - static_obstacle_slot_count_;
+        const std::size_t obstacle_count = std::min(dynamic_obstacles.size(), dynamic_slot_count);
+
+        for (std::size_t obstacle_idx = 0; obstacle_idx < obstacle_count; ++obstacle_idx) {
+            Vec3 center = dynamic_obstacles[obstacle_idx].center;
+            if (dynamic_prediction_mode_ == DynamicObstaclePredictionMode::kConstantVelocity) {
+                center += prediction_time * dynamic_obstacles[obstacle_idx].velocity;
+            }
+
+            const std::size_t offset =
+                (static_obstacle_slot_count_ + obstacle_idx) * 4;
+            params[offset + 0] = center.x();
+            params[offset + 1] = center.y();
+            params[offset + 2] = center.z();
+            params[offset + 3] = dynamic_obstacles[obstacle_idx].radius;
+        }
+        return params;
+    }
+
+    const std::vector<NMPCStageReference>& buildSingleTargetStageReferences(
+        const Vec3& filtered_target_pos,
+        const Mat3& filtered_target_rot,
+        const Vec7& q_nominal,
+        const std::vector<DynamicSphereState>& dynamic_obstacles,
+        bool dynamic_obstacles_ready,
+        const rclcpp::Time& dynamic_obstacle_stamp) {
+
+        const std::size_t stage_count = static_cast<std::size_t>(nmpc_solver_.getN() + 1);
+        if (stage_refs_buffer_.size() != stage_count) {
+            stage_refs_buffer_.resize(stage_count);
+        }
+
+        const Vec3 ee_lin_vel_ref = sorr_pos_.getLinearVelocity();
+        const Vec3 ee_ang_vel_ref = sorr_rot_.getAngularVelocity();
+        for (std::size_t stage = 0; stage < stage_count; ++stage) {
+            auto& stage_ref = stage_refs_buffer_[stage];
+            stage_ref.target_pos = filtered_target_pos;
+            stage_ref.target_rot = filtered_target_rot;
+            stage_ref.q_nom = q_nominal;
+            stage_ref.ee_lin_vel_ref = ee_lin_vel_ref;
+            stage_ref.ee_ang_vel_ref = ee_ang_vel_ref;
+            stage_ref.obstacle_params = buildObstacleParamsForStage(
+                static_cast<int>(stage),
+                dynamic_obstacles,
+                dynamic_obstacles_ready,
+                dynamic_obstacle_stamp);
+        }
+        return stage_refs_buffer_;
+    }
+
     void publishResult(const NMPCResult& result) {
         panda_interfaces::msg::ResultNMPC msg;
         Eigen::Map<Vec7>(msg.q_ref.data()) = result.q_ref;
@@ -372,9 +507,9 @@ private:
         nmpc_res_pub_->publish(msg);
     }
 
-    NMPCResult buildSafeHoldResult() const {
+    NMPCResult buildSafeHoldResult(const Vec7& q_meas) const {
         NMPCResult result;
-        result.q_ref = q_meas_;
+        result.q_ref = q_meas;
         result.v_ref.setZero();
         result.a_ref.setZero();
         result.jerk_cmd.setZero();
@@ -383,23 +518,58 @@ private:
     }
 
     void timerCallback() {
-        if (!joint_state_ready_ || !sorr_ready_) {
-            return;
+        Vec3 target_pos = Vec3::Zero();
+        Mat3 target_rot = Mat3::Identity();
+        Vec7 q_meas = Vec7::Zero();
+        Vec7 dq_meas = Vec7::Zero();
+        Vec7 q_nominal = Vec7::Zero();
+        std::vector<DynamicSphereState> dynamic_obstacles;
+        rclcpp::Time dynamic_obstacle_stamp(0, 0, RCL_ROS_TIME);
+        bool dynamic_obstacles_ready = false;
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!joint_state_ready_ || !sorr_ready_) {
+                return;
+            }
+
+            target_pos = target_pos_;
+            target_rot = target_rot_;
+            q_meas = q_meas_;
+            dq_meas = dq_meas_;
+            q_nominal = q_nominal_;
+            dynamic_obstacles = dynamic_obstacles_;
+            dynamic_obstacles_ready = dynamic_obstacles_ready_;
+            dynamic_obstacle_stamp = dynamic_obstacle_stamp_;
         }
 
-        const Vec3 filtered_target_pos = sorr_pos_.updatePosition(target_pos_);
-        const Quat filtered_target_quat = sorr_rot_.updateOrientation(target_rot_);
+        if (params_.dynamic_obstacles.enabled &&
+            dynamic_obstacles_ready &&
+            !hasFreshDynamicObstacles(dynamic_obstacle_stamp, dynamic_obstacles_ready)) {
+            const double age_sec = (this->now() - dynamic_obstacle_stamp).seconds();
+            const double timeout_sec = params_.dynamic_obstacles.timeout_sec;
+            const std::size_t obstacle_count = dynamic_obstacles.size();
+            // Keep the warning throttled, but include the measured age to make scheduler issues visible.
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Dynamic obstacle data is stale (age=%.3f s, timeout=%.3f s, obstacles=%zu). Falling back to static obstacle parameters.",
+                age_sec, timeout_sec, obstacle_count);
+        }
+
+        const Vec3 filtered_target_pos = sorr_pos_.updatePosition(target_pos);
+        const Quat filtered_target_quat = sorr_rot_.updateOrientation(target_rot);
         const Mat3 filtered_target_rot = filtered_target_quat.toRotationMatrix();
 
-        const NMPCResult result = nmpc_solver_.NMPCSolveSingleTarget(
-            filtered_target_pos,
-            filtered_target_rot,
-            q_nominal_,
-            sorr_pos_.getLinearVelocity(),
-            sorr_rot_.getAngularVelocity(),
-            runtime_obstacle_params_,
-            q_meas_,
-            dq_meas_);
+        const NMPCResult result = nmpc_solver_.NMPCSolveStageReferences(
+            buildSingleTargetStageReferences(
+                filtered_target_pos,
+                filtered_target_rot,
+                q_nominal,
+                dynamic_obstacles,
+                dynamic_obstacles_ready,
+                dynamic_obstacle_stamp),
+            q_meas,
+            dq_meas);
 
         if (result.status == 0) {
             consecutive_failure_count_ = 0;
@@ -420,7 +590,7 @@ private:
             return;
         }
 
-        publishResult(buildSafeHoldResult());
+        publishResult(buildSafeHoldResult(q_meas));
     }
 
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg) {
@@ -438,6 +608,8 @@ private:
                 msg->velocity.size(), ordered_names_.size());
         }
 
+        Vec7 q_meas = Vec7::Zero();
+        Vec7 dq_meas = Vec7::Zero();
         for (std::size_t i = 0; i < ordered_names_.size(); ++i) {
             const auto it = std::find(msg->name.begin(), msg->name.end(), ordered_names_[i]);
             if (it == msg->name.end()) {
@@ -448,10 +620,13 @@ private:
             }
 
             const std::size_t idx = static_cast<std::size_t>(std::distance(msg->name.begin(), it));
-            q_meas_(static_cast<Eigen::Index>(i)) = msg->position[idx];
-            dq_meas_(static_cast<Eigen::Index>(i)) = (idx < msg->velocity.size()) ? msg->velocity[idx] : 0.0;
+            q_meas(static_cast<Eigen::Index>(i)) = msg->position[idx];
+            dq_meas(static_cast<Eigen::Index>(i)) = (idx < msg->velocity.size()) ? msg->velocity[idx] : 0.0;
         }
 
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        q_meas_ = q_meas;
+        dq_meas_ = dq_meas;
         joint_state_ready_ = true;
 
         if (params_.use_current_q_as_nominal_on_startup && !nominal_initialized_from_state_) {
@@ -465,8 +640,6 @@ private:
     }
 
     void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-        target_pos_ << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
-
         const Quat quat(
             msg->pose.orientation.w,
             msg->pose.orientation.x,
@@ -476,7 +649,83 @@ private:
             RCLCPP_WARN(this->get_logger(), "Received invalid target quaternion, ignoring orientation update.");
             return;
         }
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        target_pos_ << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
         target_rot_ = quat.normalized().toRotationMatrix();
+    }
+
+    void dynamicObstacleCallback(const DynamicSphereArrayMsg::SharedPtr msg) {
+        std::vector<DynamicSphereState> dynamic_obstacles;
+        rclcpp::Time dynamic_obstacle_stamp(0, 0, RCL_ROS_TIME);
+        if (msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0) {
+            dynamic_obstacle_stamp = this->now();
+        } else {
+            dynamic_obstacle_stamp = rclcpp::Time(msg->header.stamp);
+        }
+
+        const std::size_t dynamic_slot_count =
+            PandaNMPCController::kNumRuntimeObstacles - static_obstacle_slot_count_;
+        if (dynamic_slot_count == 0) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Static obstacles already occupy all %zu solver slots. Dynamic obstacles are ignored.",
+                PandaNMPCController::kNumRuntimeObstacles);
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            dynamic_obstacles_.clear();
+            dynamic_obstacle_stamp_ = dynamic_obstacle_stamp;
+            dynamic_obstacles_ready_ = false;
+            return;
+        }
+
+        if (msg->spheres.size() > dynamic_slot_count) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Received %zu dynamic obstacle(s) but only %zu dynamic slot(s) are free after reserving %zu static slot(s). Extra obstacles are ignored.",
+                msg->spheres.size(),
+                dynamic_slot_count,
+                static_obstacle_slot_count_);
+        }
+
+        const std::size_t obstacle_count = std::min(msg->spheres.size(), dynamic_slot_count);
+        dynamic_obstacles.reserve(obstacle_count);
+        for (std::size_t obstacle_idx = 0; obstacle_idx < obstacle_count; ++obstacle_idx) {
+            const auto& sphere = msg->spheres[obstacle_idx];
+            if (!(sphere.radius > 0.0)) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Ignoring dynamic obstacle '%s' with non-positive radius %.6f.",
+                    sphere.name.c_str(),
+                    sphere.radius);
+                continue;
+            }
+
+            DynamicSphereState state;
+            state.name = sphere.name;
+            state.center << sphere.center.x, sphere.center.y, sphere.center.z;
+            state.velocity << sphere.velocity.x, sphere.velocity.y, sphere.velocity.z;
+            state.radius = sphere.radius;
+            dynamic_obstacles.push_back(state);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            dynamic_obstacles_ = dynamic_obstacles;
+            dynamic_obstacle_stamp_ = dynamic_obstacle_stamp;
+            dynamic_obstacles_ready_ = !dynamic_obstacles_.empty();
+        }
+
+        std::ostringstream stream;
+        stream << "Updated " << dynamic_obstacles.size()
+               << " dynamic obstacle(s); static obstacles keep the first "
+               << static_obstacle_slot_count_ << " slot(s)";
+        if (dynamic_prediction_mode_ == DynamicObstaclePredictionMode::kConstantVelocity) {
+            stream << " using constant-velocity prediction.";
+        } else {
+            stream << " using zero-order-hold prediction.";
+        }
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000, "%s", stream.str().c_str());
     }
 
     void jointTrajectoryCallback(const trajectory_msgs::msg::JointTrajectory::SharedPtr /*msg*/) {
@@ -499,6 +748,7 @@ public:
         initializePinocchio();
         loadStaticObstacles();
         setSorrConfig();
+        stage_refs_buffer_.resize(static_cast<std::size_t>(nmpc_solver_.getN() + 1));
 
         last_valid_result_.status = -1;
         last_valid_result_.q_ref = q_nominal_;
@@ -506,30 +756,56 @@ public:
         last_valid_result_.a_ref.setZero();
         last_valid_result_.jerk_cmd.setZero();
 
+        timer_callback_group_ =
+            this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        state_callback_group_ =
+            this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        dynamic_obstacle_callback_group_ =
+            this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        rclcpp::SubscriptionOptions state_sub_options;
+        state_sub_options.callback_group = state_callback_group_;
+
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             params_.joint_states_topic, 10,
-            [this](const sensor_msgs::msg::JointState::SharedPtr msg) { jointStateCallback(msg); });
+            [this](const sensor_msgs::msg::JointState::SharedPtr msg) { jointStateCallback(msg); },
+            state_sub_options);
 
         joint_trajectory_sub_ = this->create_subscription<trajectory_msgs::msg::JointTrajectory>(
             params_.joint_trajectory_topic, 10,
-            [this](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) { jointTrajectoryCallback(msg); });
+            [this](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) { jointTrajectoryCallback(msg); },
+            state_sub_options);
 
         target_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             params_.target_pose_topic, 10,
-            [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) { targetPoseCallback(msg); });
+            [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) { targetPoseCallback(msg); },
+            state_sub_options);
+
+        if (params_.dynamic_obstacles.enabled) {
+            rclcpp::SubscriptionOptions dynamic_obstacle_sub_options;
+            dynamic_obstacle_sub_options.callback_group = dynamic_obstacle_callback_group_;
+            dynamic_obstacle_sub_ = this->create_subscription<DynamicSphereArrayMsg>(
+                params_.dynamic_obstacles.topic, 10,
+                [this](const DynamicSphereArrayMsg::SharedPtr msg) { dynamicObstacleCallback(msg); },
+                dynamic_obstacle_sub_options);
+        }
 
         nmpc_res_pub_ =
             this->create_publisher<panda_interfaces::msg::ResultNMPC>(params_.nmpc_result_topic, 1);
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(static_cast<int64_t>(1000.0 * nmpc_solver_.getDt())),
-            [this]() { timerCallback(); });
+            [this]() { timerCallback(); },
+            timer_callback_group_);
 
         RCLCPP_INFO(
             this->get_logger(),
-            "NMPC single-pose node started. urdf=%s, ee_frame=%s, obstacle_source=%s, joint_states_topic=%s, target_pose_topic=%s, result_topic=%s, joint_trajectory_topic=%s (ignored), use_global_trajectory=%s (ignored)",
+            "NMPC single-pose node started. urdf=%s, ee_frame=%s, static_obstacle_source=%s, dynamic_obstacles=%s, dynamic_topic=%s, dynamic_prediction=%s, joint_states_topic=%s, target_pose_topic=%s, result_topic=%s, joint_trajectory_topic=%s (ignored), use_global_trajectory=%s (ignored), executor=MultiThreadedExecutor",
             params_.urdf_path.c_str(),
             params_.ee_frame_name.c_str(),
             selectObstacleSourcePath().c_str(),
+            params_.dynamic_obstacles.enabled ? "enabled" : "disabled",
+            params_.dynamic_obstacles.topic.c_str(),
+            params_.dynamic_obstacles.prediction_mode.c_str(),
             params_.joint_states_topic.c_str(),
             params_.target_pose_topic.c_str(),
             params_.nmpc_result_topic.c_str(),
@@ -541,7 +817,9 @@ public:
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<NMPCNode>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

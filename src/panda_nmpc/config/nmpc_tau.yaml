@@ -12,9 +12,9 @@ nmpc_tau_node:
     nmpc_result_topic: "/nmpc_result"
     target_pose_topic: "/global_target_pose"
 
-    target_x: 0.74
-    target_y: 0.0
-    target_z: 0.25
+    target_x: 0.55
+    target_y: -0.30
+    target_z: 0.30
     target_qx: 1.0
     target_qy: 0.0
     target_qz: 0.0
@@ -34,6 +34,12 @@ nmpc_tau_node:
     sorr_rot_max_angular_velocity: 0.07845
     sorr_rot_max_angular_acceleration: 0.7845
 
+    dynamic_obstacles:
+      enabled: true
+      topic: "/dynamic_sphere_obstacles"
+      prediction_mode: "constant_velocity"
+      timeout_sec: 0.2
+
     nominal_posture:
       q: [0.0, 0.0, 0.0, -1.5708, 0.0, 1.8675, 0.0]
 
@@ -43,9 +49,9 @@ nmpc_tau_node:
         rot: [10.0, 10.0, 10.0]
         ee_lin_vel: [0.0, 0.0, 0.0]
         ee_ang_vel: [0.0, 0.0, 0.0]
-        q_reg: [0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
-        dq_reg: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-        ddq_reg: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+        q_reg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        dq_reg: [0.5, 0.5, 0.1, 0.1, 0.1, 0.1, 0.1]
+        ddq_reg: [0.5, 0.5, 0.5, 0.5, 0.5, 0.1, 0.1]
 
       terminal:
         pos: [4000.0, 4000.0, 4000.0]
@@ -53,19 +59,19 @@ nmpc_tau_node:
         ee_lin_vel: [0.0, 0.0, 0.0]
         ee_ang_vel: [0.0, 0.0, 0.0]
         q_reg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        dq_reg: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        dq_reg: [10.0, 10.0, 10.0, 10.0, 10.0, 1.0, 1.0]
 
     limits:
       hard:
         q_lower: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
         q_upper: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
         dq_abs: [2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100]
-        ddq_abs: [5.0, 2.5, 3.4, 4.3, 5.0, 6.7, 6.7]
+        ddq_abs: [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
 
     obstacle_constraint:
       stage:
         slack_linear: 0.0
-        slack_quadratic: 1000000.0
+        slack_quadratic: 10000.0
       terminal:
         slack_linear: 0.0
-        slack_quadratic: 1000000.0
+        slack_quadratic: 10000.0

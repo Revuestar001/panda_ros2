@@ -1,0 +1,34 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+    topic: "/dynamic_sphere_obstacles"
+    frame_id: "world"
+    publish_rate_hz: 30.0
+
+    obstacles:
+      names: ["dyn_obs_left", 
+              # "dyn_obs_right",
+             ]
+      radii: [0.05, 
+              # 0.06,
+             ]
+      reference_positions:
+        [
+          0.4, -0.20, 0.45,
+          # 0.55,  0.18, 0.45,
+        ]
+      amplitudes:
+        [
+          0.00, 0.16, 0.00,
+          # 0.08, 0.00, 0.05,
+        ]
+      frequencies_hz:
+        [
+          0.00, 0.08, 0.00,
+          # 0.06, 0.00, 0.12,
+        ]
+      phase_offsets:
+        [
+          0.0, 0.0, 0.0,
+          # 1.5707963267948966, 0.0, 3.1415926535897932,
+        ]

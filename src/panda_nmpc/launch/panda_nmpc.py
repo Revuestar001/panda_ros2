@@ -43,6 +43,7 @@ import subprocess
 from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
+from launch.conditions import IfCondition
 from launch.substitutions import (
     Command,
     FindExecutable,
@@ -96,6 +97,8 @@ def launch_setup(context, *args, **kwargs):
 
     parameters_file = PathJoinSubstitution([pkg_share, "config", "pinoController.yaml"])
     nmpc_params_file = LaunchConfiguration("nmpc_params_file")
+    dynamic_obstacle_topic = LaunchConfiguration("dynamic_obstacle_topic")
+    dynamic_obstacle_publisher_params_file = LaunchConfiguration("dynamic_obstacle_publisher_params_file")
 
     nodes = []
 
@@ -119,6 +122,8 @@ def launch_setup(context, *args, **kwargs):
                 {
                     "obstacle_config_path": obstacle_config_path,
                     "scene_xml_path": scene_xml_path,
+                    "dynamic_obstacles.enabled": LaunchConfiguration("enable_dynamic_obstacles"),
+                    "dynamic_obstacles.topic": dynamic_obstacle_topic,
                 },
             ],
             # on_exit=Shutdown(),
@@ -144,11 +149,39 @@ def launch_setup(context, *args, **kwargs):
             parameters=[
                 {"use_sim_time": True},
                 ParameterFile(parameters_file),
+                {
+                    "mujoco_plugins.dynamic_sphere_visualization.type":
+                        "mujoco_ros2_control_plugins/DynamicSphereVisualizationPlugin",
+                    "mujoco_plugins.dynamic_sphere_visualization.topic": dynamic_obstacle_topic,
+                    "mujoco_plugins.dynamic_sphere_visualization.max_spheres": 8,
+                    "mujoco_plugins.dynamic_sphere_visualization.timeout_sec": 0.25,
+                    "mujoco_plugins.dynamic_sphere_visualization.hidden_z": -5.0,
+                    "mujoco_plugins.dynamic_sphere_visualization.body_name_prefix":
+                        "dynamic_obstacle_mocap_",
+                    "mujoco_plugins.dynamic_sphere_visualization.geom_name_prefix":
+                        "dynamic_obstacle_geom_",
+                },
             ],
             remappings=(
                 [("~/robot_description", "/robot_description")] if os.environ.get("ROS_DISTRO") == "humble" else []
             ),
             on_exit=Shutdown(),
+        )
+    )
+
+    nodes.append(
+        Node(
+            package="panda_nmpc",
+            executable="dynamic_sphere_obstacle_publisher",
+            output="both",
+            parameters=[
+                ParameterFile(dynamic_obstacle_publisher_params_file, allow_substs=True),
+                {
+                    "use_sim_time": True,
+                    "topic": dynamic_obstacle_topic,
+                },
+            ],
+            condition=IfCondition(LaunchConfiguration("start_dynamic_obstacle_publisher")),
         )
     )
 
@@ -179,6 +212,28 @@ def generate_launch_description():
         default_value=PathJoinSubstitution([FindPackageShare("panda_nmpc"), "config", "nmpc_tau.yaml"]),
         description="Parameter file that provides all runtime NMPC settings",
     )
+    enable_dynamic_obstacles = DeclareLaunchArgument(
+        "enable_dynamic_obstacles",
+        default_value="false",
+        description="Enable dynamic sphere obstacles inside the NMPC node.",
+    )
+    dynamic_obstacle_topic = DeclareLaunchArgument(
+        "dynamic_obstacle_topic",
+        default_value="/dynamic_sphere_obstacles",
+        description="Shared topic used by the obstacle publisher, NMPC node and MuJoCo visualization plugin.",
+    )
+    start_dynamic_obstacle_publisher = DeclareLaunchArgument(
+        "start_dynamic_obstacle_publisher",
+        default_value="false",
+        description="Start the demo dynamic obstacle publisher node.",
+    )
+    dynamic_obstacle_publisher_params_file = DeclareLaunchArgument(
+        "dynamic_obstacle_publisher_params_file",
+        default_value=PathJoinSubstitution(
+            [FindPackageShare("panda_nmpc"), "config", "dynamic_sphere_obstacle_publisher.yaml"]
+        ),
+        description="Parameter file for the demo dynamic obstacle publisher node.",
+    )
     obstacle_config_path = DeclareLaunchArgument(
         "obstacle_config_path",
         default_value="/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml",
@@ -194,6 +249,10 @@ def generate_launch_description():
         [
             headless,
             nmpc_params_file,
+            enable_dynamic_obstacles,
+            dynamic_obstacle_topic,
+            start_dynamic_obstacle_publisher,
+            dynamic_obstacle_publisher_params_file,
             obstacle_config_path,
             scene_xml_path,
             OpaqueFunction(function=launch_setup),

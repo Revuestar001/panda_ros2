@@ -91,6 +91,10 @@ add_executable(nmpc_tau_original
   src/nmpc_tau_original.cpp
 )
 
+add_executable(dynamic_sphere_obstacle_publisher
+  src/dynamic_sphere_obstacle_publisher.cpp
+)
+
 # 包含所有的头文件路径
 target_include_directories(nmpc_tau PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -104,8 +108,14 @@ target_include_directories(nmpc_tau_original PUBLIC
   ${ACADOS_INCLUDE_DIRS}
 )
 
+target_include_directories(dynamic_sphere_obstacle_publisher PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
 target_compile_features(nmpc_tau PUBLIC c_std_99 cxx_std_17) 
 target_compile_features(nmpc_tau_original PUBLIC c_std_99 cxx_std_17)
+target_compile_features(dynamic_sphere_obstacle_publisher PUBLIC cxx_std_17)
 
 # 3. 链接目标与库
 ament_target_dependencies(nmpc_tau 
@@ -127,6 +137,11 @@ ament_target_dependencies(nmpc_tau_original
   sensor_msgs
   panda_interfaces
   "trajectory_msgs"
+)
+
+ament_target_dependencies(dynamic_sphere_obstacle_publisher
+  "rclcpp"
+  panda_interfaces
 )
 
 # 链接 Acados 库和生成的求解器动态库
@@ -163,6 +178,9 @@ set_target_properties(nmpc_tau_original PROPERTIES
 # 4. 安装规则
 # 安装可执行文件
 install(TARGETS nmpc_tau nmpc_tau_original
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS dynamic_sphere_obstacle_publisher
   DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS panda_task_space_nmpc_generated_solver
