@@ -12,7 +12,7 @@ nmpc_tau_node:
     nmpc_result_topic: "/nmpc_result"
     target_pose_topic: "/global_target_pose"
 
-    target_x: 0.25
+    target_x: 0.20
     target_y: 0.00
     target_z: 0.25
     target_qx: 1.0
@@ -20,7 +20,7 @@ nmpc_tau_node:
     target_qz: 0.0
     target_qw: 0.0
 
-    use_global_trajectory: false
+    use_global_trajectory: true
     use_current_q_as_nominal_on_startup: false
     max_consecutive_failures_before_hold: 2
 
@@ -47,6 +47,19 @@ nmpc_tau_node:
       prediction_mode: "constant_velocity"
       timeout_sec: 0.2
 
+    path_following:
+      enabled: true
+      wait_for_fresh_path_after_target_update: true
+      lookahead_distance: 0.03
+      desired_stage_spacing: 0.015
+      max_stage_average_speed: 0.08
+      max_head_advance_speed: 0.06
+      terminal_target_segment_length: 0.03
+      completion_path_tolerance: 0.005
+      completion_position_tolerance: 0.01
+      completion_orientation_tolerance: 0.10
+      rotation_metric_weight: 0.02
+
     debug:
       acados:
         enabled: true
@@ -55,6 +68,10 @@ nmpc_tau_node:
         slack_activation_threshold: 1.0e-4
         include_stage_slack_summary: true
         max_reported_stages: 4
+      nearest_obstacle_distance:
+        enabled: true
+        topic: "/nmpc_nearest_sphere_obstacle_distance"
+        include_in_acados_report: true
 
     nominal_posture:
       q: [0.0, 0.0, 0.0, -1.5708, 0.0, 1.8675, 0.0]
@@ -65,7 +82,7 @@ nmpc_tau_node:
         rot: [10.0, 10.0, 10.0]
         ee_lin_vel: [0.0, 0.0, 0.0]
         ee_ang_vel: [0.0, 0.0, 0.0]
-        q_reg: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        q_reg: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
         dq_reg: [0.5, 0.5, 0.1, 0.1, 0.1, 0.1, 0.1]
         ddq_reg: [0.5, 0.5, 0.5, 0.5, 0.5, 0.1, 0.1]
 

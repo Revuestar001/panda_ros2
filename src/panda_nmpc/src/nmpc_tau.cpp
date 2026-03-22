@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -21,6 +22,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "panda_interfaces/msg/dynamic_sphere_array.hpp"
@@ -41,6 +43,7 @@ private:
     using Mat3 = Eigen::Matrix3d;
     using Quat = Eigen::Quaterniond;
     using DynamicSphereArrayMsg = panda_interfaces::msg::DynamicSphereArray;
+    using Float64Msg = std_msgs::msg::Float64;
 
     // =========================================================================
     // Parameter and Runtime Configuration Types
@@ -48,6 +51,12 @@ private:
     enum class DynamicObstaclePredictionMode {
         kZeroOrderHold = 0,
         kConstantVelocity,
+    };
+
+    enum class PathTrackingState {
+        kTargetOnly = 0,
+        kFollowingPath,
+        kTerminalTarget,
     };
 
     // Dynamic obstacle subscription policy shared by the timer loop and the
@@ -67,6 +76,22 @@ private:
         double radius{0.0};
     };
 
+    struct RobotCollisionSphere {
+        std::string name;
+        std::string frame_name;
+        pinocchio::FrameIndex frame_id{0};
+        Vec3 offset{Vec3::Zero()};
+        double radius{0.0};
+    };
+
+    struct NearestObstacleDistanceInfo {
+        bool available{false};
+        double signed_distance{std::numeric_limits<double>::infinity()};
+        std::string robot_sphere_name;
+        std::string obstacle_name;
+        bool obstacle_is_dynamic{false};
+    };
+
     // Low-frequency acados debug logging policy.
     struct AcadosDebugLogConfig {
         bool enabled{false};
@@ -77,6 +102,28 @@ private:
         int max_reported_stages{4};
     };
 
+    struct ObstacleDistanceMonitorConfig {
+        bool enabled{true};
+        std::string topic{"/nmpc_nearest_sphere_obstacle_distance"};
+        bool include_in_acados_report{true};
+    };
+
+    // Carrot-point path-following configuration. Distances are measured in a
+    // pose-space metric: translation norm plus a weighted orientation error.
+    struct PathFollowingConfig {
+        bool enabled{true};
+        bool wait_for_fresh_path_after_target_update{true};
+        double lookahead_distance{0.03};
+        double desired_stage_spacing{0.015};
+        double max_stage_average_speed{0.08};
+        double max_head_advance_speed{0.06};
+        double terminal_target_segment_length{0.03};
+        double completion_path_tolerance{0.005};
+        double completion_position_tolerance{0.01};
+        double completion_orientation_tolerance{0.10};
+        double rotation_metric_weight{0.02};
+    };
+
     // Minimal input sanitation for externally commanded target poses.
     struct TargetPoseValidationConfig {
         bool enabled{true};
@@ -84,6 +131,39 @@ private:
         bool allow_empty_frame_id{true};
         double max_position_norm{2.0};
         double min_quaternion_norm{1.0e-9};
+    };
+
+    struct PathWaypoint {
+        double path_s{0.0};
+        Vec7 q{Vec7::Zero()};
+        Vec3 ee_pos{Vec3::Zero()};
+        Mat3 ee_rot{Mat3::Identity()};
+    };
+
+    struct JointPathReference {
+        std::vector<PathWaypoint> waypoints;
+        double total_path_s{0.0};
+        Vec7 terminal_q{Vec7::Zero()};
+    };
+
+    struct PathReferenceSample {
+        Vec7 q_nom{Vec7::Zero()};
+        Vec3 ee_pos{Vec3::Zero()};
+        Mat3 ee_rot{Mat3::Identity()};
+    };
+
+    struct PathTrackingSnapshot {
+        std::shared_ptr<const JointPathReference> active_path;
+        PathTrackingState state{PathTrackingState::kTargetOnly};
+        double reference_head_s{0.0};
+        std::size_t closest_index_hint{0};
+        Vec7 terminal_q_nominal{Vec7::Zero()};
+        bool waiting_for_fresh_path{false};
+        rclcpp::Time last_target_pose_update_stamp{0, 0, RCL_ROS_TIME};
+        Vec3 latched_wait_target_pos{Vec3::Zero()};
+        Mat3 latched_wait_target_rot{Mat3::Identity()};
+        Vec7 latched_wait_q_nominal{Vec7::Zero()};
+        bool latched_wait_reference_valid{false};
     };
 
     // Centralized runtime parameter bundle. All ROS parameters are declared once
@@ -118,7 +198,9 @@ private:
 
         DynamicObstacleConfig dynamic_obstacles{};
         AcadosDebugLogConfig acados_debug{};
+        ObstacleDistanceMonitorConfig obstacle_distance_monitor{};
         TargetPoseValidationConfig target_pose_validation{};
+        PathFollowingConfig path_following{};
 
         PandaNMPCController::CostWeights cost_weights{PandaNMPCController::defaultCostWeights()};
         PandaNMPCController::HardLimits hard_limits{PandaNMPCController::defaultHardLimits()};
@@ -159,8 +241,10 @@ private:
     pinocchio::Model pin_model_;
     std::unique_ptr<pinocchio::Data> pin_data_;
     pinocchio::FrameIndex ee_frame_id_{0};
+    mutable std::mutex pinocchio_mutex_;
 
     std::vector<panda_nmpc::StaticSphereObstacle> scene_obstacles_;
+    std::vector<RobotCollisionSphere> robot_collision_spheres_;
     PandaNMPCController::ObstacleParamBlock static_obstacle_params_{
         PandaNMPCController::disabledObstacleParams()};
     std::size_t static_obstacle_slot_count_{0};
@@ -170,12 +254,28 @@ private:
     DynamicObstaclePredictionMode dynamic_prediction_mode_{DynamicObstaclePredictionMode::kConstantVelocity};
     std::vector<NMPCStageReference> stage_refs_buffer_;
     rclcpp::Time last_acados_debug_log_stamp_{0, 0, RCL_ROS_TIME};
+    double min_recorded_nearest_obstacle_distance_{std::numeric_limits<double>::infinity()};
+    std::string min_recorded_robot_sphere_name_;
+    std::string min_recorded_obstacle_name_;
+    bool min_recorded_obstacle_is_dynamic_{false};
+    std::shared_ptr<const JointPathReference> active_joint_path_;
+    PathTrackingState path_tracking_state_{PathTrackingState::kTargetOnly};
+    double path_reference_head_s_{0.0};
+    std::size_t path_closest_index_hint_{0};
+    Vec7 path_terminal_q_nominal_{Vec7::Zero()};
+    bool waiting_for_fresh_path_after_target_update_{false};
+    rclcpp::Time last_target_pose_update_stamp_{0, 0, RCL_ROS_TIME};
+    Vec3 latched_wait_target_pos_{Vec3::Zero()};
+    Mat3 latched_wait_target_rot_{Mat3::Identity()};
+    Vec7 latched_wait_q_nominal_{Vec7::Zero()};
+    bool latched_wait_reference_valid_{false};
     mutable std::mutex state_mutex_;
 
     // =========================================================================
     // ROS Interfaces
     // =========================================================================
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
+    rclcpp::Publisher<Float64Msg>::SharedPtr nearest_obstacle_distance_pub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_trajectory_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_sub_;
@@ -253,6 +353,13 @@ private:
         throw std::runtime_error(
             "Unsupported dynamic obstacle prediction mode '" + value +
             "'. Use 'constant_velocity' or 'zero_order_hold'.");
+    }
+
+    static double rotationAngularDistance(const Mat3& rot_a, const Mat3& rot_b) {
+        const Quat q_a(rot_a);
+        const Quat q_b(rot_b);
+        const double dot = std::clamp(std::abs(q_a.dot(q_b)), 0.0, 1.0);
+        return 2.0 * std::acos(dot);
     }
 
     // Render debug scalars in a stable way so acados logs remain readable even
@@ -407,6 +514,78 @@ private:
         params_.acados_debug.max_reported_stages =
             static_cast<int>(std::max<int64_t>(1, max_reported_stages));
 
+        params_.obstacle_distance_monitor.enabled = this->declare_parameter<bool>(
+            "debug.nearest_obstacle_distance.enabled",
+            params_.obstacle_distance_monitor.enabled);
+        params_.obstacle_distance_monitor.topic = this->declare_parameter<std::string>(
+            "debug.nearest_obstacle_distance.topic",
+            params_.obstacle_distance_monitor.topic);
+        params_.obstacle_distance_monitor.include_in_acados_report =
+            this->declare_parameter<bool>(
+                "debug.nearest_obstacle_distance.include_in_acados_report",
+                params_.obstacle_distance_monitor.include_in_acados_report);
+
+        params_.path_following.enabled =
+            this->declare_parameter<bool>("path_following.enabled", params_.path_following.enabled);
+        params_.path_following.wait_for_fresh_path_after_target_update =
+            this->declare_parameter<bool>(
+                "path_following.wait_for_fresh_path_after_target_update",
+                params_.path_following.wait_for_fresh_path_after_target_update);
+        params_.path_following.lookahead_distance = this->declare_parameter<double>(
+            "path_following.lookahead_distance", params_.path_following.lookahead_distance);
+        params_.path_following.desired_stage_spacing = this->declare_parameter<double>(
+            "path_following.desired_stage_spacing", params_.path_following.desired_stage_spacing);
+        params_.path_following.max_stage_average_speed = this->declare_parameter<double>(
+            "path_following.max_stage_average_speed", params_.path_following.max_stage_average_speed);
+        params_.path_following.max_head_advance_speed = this->declare_parameter<double>(
+            "path_following.max_head_advance_speed", params_.path_following.max_head_advance_speed);
+        params_.path_following.terminal_target_segment_length = this->declare_parameter<double>(
+            "path_following.terminal_target_segment_length",
+            params_.path_following.terminal_target_segment_length);
+        params_.path_following.completion_path_tolerance = this->declare_parameter<double>(
+            "path_following.completion_path_tolerance",
+            params_.path_following.completion_path_tolerance);
+        params_.path_following.completion_position_tolerance = this->declare_parameter<double>(
+            "path_following.completion_position_tolerance",
+            params_.path_following.completion_position_tolerance);
+        params_.path_following.completion_orientation_tolerance = this->declare_parameter<double>(
+            "path_following.completion_orientation_tolerance",
+            params_.path_following.completion_orientation_tolerance);
+        params_.path_following.rotation_metric_weight = this->declare_parameter<double>(
+            "path_following.rotation_metric_weight",
+            params_.path_following.rotation_metric_weight);
+        if (params_.path_following.lookahead_distance < 0.0) {
+            throw std::runtime_error("Parameter 'path_following.lookahead_distance' must be >= 0.");
+        }
+        if (params_.path_following.desired_stage_spacing <= 0.0) {
+            throw std::runtime_error("Parameter 'path_following.desired_stage_spacing' must be > 0.");
+        }
+        if (params_.path_following.max_stage_average_speed <= 0.0) {
+            throw std::runtime_error("Parameter 'path_following.max_stage_average_speed' must be > 0.");
+        }
+        if (params_.path_following.max_head_advance_speed <= 0.0) {
+            throw std::runtime_error("Parameter 'path_following.max_head_advance_speed' must be > 0.");
+        }
+        if (params_.path_following.terminal_target_segment_length <= 0.0) {
+            throw std::runtime_error(
+                "Parameter 'path_following.terminal_target_segment_length' must be > 0.");
+        }
+        if (params_.path_following.completion_path_tolerance < 0.0) {
+            throw std::runtime_error(
+                "Parameter 'path_following.completion_path_tolerance' must be >= 0.");
+        }
+        if (params_.path_following.completion_position_tolerance <= 0.0) {
+            throw std::runtime_error(
+                "Parameter 'path_following.completion_position_tolerance' must be > 0.");
+        }
+        if (params_.path_following.completion_orientation_tolerance <= 0.0) {
+            throw std::runtime_error(
+                "Parameter 'path_following.completion_orientation_tolerance' must be > 0.");
+        }
+        if (params_.path_following.rotation_metric_weight < 0.0) {
+            throw std::runtime_error("Parameter 'path_following.rotation_metric_weight' must be >= 0.");
+        }
+
         const auto default_weights = PandaNMPCController::defaultCostWeights();
         params_.cost_weights.pos = declareFixedSizeArrayParameter("nmpc_weights.stage.pos", default_weights.pos);
         params_.cost_weights.rot = declareFixedSizeArrayParameter("nmpc_weights.stage.rot", default_weights.rot);
@@ -478,6 +657,94 @@ private:
     // =========================================================================
     // Everything here runs once during construction and produces immutable
     // resources that the timer loop later reuses.
+    void loadRobotCollisionSpheres() {
+        robot_collision_spheres_.clear();
+
+        tinyxml2::XMLDocument doc;
+        const tinyxml2::XMLError load_status = doc.LoadFile(params_.urdf_path.c_str());
+        if (load_status != tinyxml2::XML_SUCCESS) {
+            throw std::runtime_error(
+                "Failed to load Panda URDF '" + params_.urdf_path + "' for robot collision spheres: " +
+                (doc.ErrorStr() == nullptr ? std::string("unknown error") : std::string(doc.ErrorStr())));
+        }
+
+        const tinyxml2::XMLElement* root = doc.RootElement();
+        if (root == nullptr) {
+            throw std::runtime_error("URDF '" + params_.urdf_path + "' has no root element.");
+        }
+
+        for (const tinyxml2::XMLElement* link_elem = root->FirstChildElement("link");
+             link_elem != nullptr;
+             link_elem = link_elem->NextSiblingElement("link")) {
+            const char* link_name_attr = link_elem->Attribute("name");
+            if (link_name_attr == nullptr) {
+                continue;
+            }
+
+            const std::string frame_name = link_name_attr;
+            if (!pin_model_.existFrame(frame_name)) {
+                continue;
+            }
+            const pinocchio::FrameIndex frame_id = pin_model_.getFrameId(frame_name);
+
+            int sphere_index = 0;
+            for (const tinyxml2::XMLElement* visual_elem = link_elem->FirstChildElement("visual");
+                 visual_elem != nullptr;
+                 visual_elem = visual_elem->NextSiblingElement("visual")) {
+                const tinyxml2::XMLElement* geometry_elem = visual_elem->FirstChildElement("geometry");
+                if (geometry_elem == nullptr) {
+                    continue;
+                }
+
+                const tinyxml2::XMLElement* sphere_elem = geometry_elem->FirstChildElement("sphere");
+                if (sphere_elem == nullptr) {
+                    continue;
+                }
+
+                const char* radius_attr = sphere_elem->Attribute("radius");
+                if (radius_attr == nullptr) {
+                    continue;
+                }
+
+                double radius = 0.0;
+                std::istringstream radius_stream(radius_attr);
+                if (!(radius_stream >> radius) || !(radius > 0.0)) {
+                    continue;
+                }
+
+                Vec3 offset = Vec3::Zero();
+                const tinyxml2::XMLElement* origin_elem = visual_elem->FirstChildElement("origin");
+                if (origin_elem != nullptr) {
+                    const char* xyz_attr = origin_elem->Attribute("xyz");
+                    if (xyz_attr != nullptr) {
+                        offset = panda_nmpc::parse_xyz_attribute(xyz_attr);
+                    }
+                }
+
+                RobotCollisionSphere sphere;
+                sphere.name = frame_name + "::sphere_" + std::to_string(sphere_index++);
+                sphere.frame_name = frame_name;
+                sphere.frame_id = frame_id;
+                sphere.offset = offset;
+                sphere.radius = radius;
+                robot_collision_spheres_.push_back(sphere);
+            }
+        }
+
+        if (robot_collision_spheres_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "No robot collision spheres were found in URDF visuals. Nearest obstacle distance monitoring will be unavailable.");
+            return;
+        }
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Loaded %zu robot collision sphere(s) from '%s' for nearest-distance monitoring.",
+            robot_collision_spheres_.size(),
+            params_.urdf_path.c_str());
+    }
+
     void loadStaticObstacles() {
         static_obstacle_params_ = PandaNMPCController::disabledObstacleParams();
         static_obstacle_slot_count_ = 0;
@@ -542,6 +809,7 @@ private:
             throw std::runtime_error("EE frame '" + params_.ee_frame_name + "' not found in URDF.");
         }
         ee_frame_id_ = pin_model_.getFrameId(params_.ee_frame_name);
+        loadRobotCollisionSpheres();
     }
 
     // =========================================================================
@@ -567,13 +835,88 @@ private:
         sorr_rot_.setConfig(rot_config);
     }
 
-    // Compute the current end-effector pose from the latest joint measurement.
-    void computeCurrentEePose(Vec3& ee_pos, Mat3& ee_rot) {
-        pinocchio::forwardKinematics(pin_model_, *pin_data_, q_meas_);
+    void computeEePoseForConfiguration(const Vec7& q, Vec3& ee_pos, Mat3& ee_rot) const {
+        std::lock_guard<std::mutex> lock(pinocchio_mutex_);
+        pinocchio::forwardKinematics(pin_model_, *pin_data_, q);
         pinocchio::updateFramePlacements(pin_model_, *pin_data_);
         const auto& transform = pin_data_->oMf[ee_frame_id_];
         ee_pos = transform.translation();
         ee_rot = transform.rotation();
+    }
+
+    void computeCurrentGeometrySnapshot(
+        const Vec7& q,
+        Vec3& ee_pos,
+        Mat3& ee_rot,
+        const std::vector<DynamicSphereState>& dynamic_obstacles,
+        bool use_dynamic_obstacles,
+        NearestObstacleDistanceInfo* nearest_distance_info) const {
+        std::lock_guard<std::mutex> lock(pinocchio_mutex_);
+        pinocchio::forwardKinematics(pin_model_, *pin_data_, q);
+        pinocchio::updateFramePlacements(pin_model_, *pin_data_);
+        const auto& ee_transform = pin_data_->oMf[ee_frame_id_];
+        ee_pos = ee_transform.translation();
+        ee_rot = ee_transform.rotation();
+
+        if (nearest_distance_info == nullptr) {
+            return;
+        }
+
+        *nearest_distance_info = NearestObstacleDistanceInfo{};
+        if (robot_collision_spheres_.empty()) {
+            return;
+        }
+
+        auto try_update_min_distance =
+            [&nearest_distance_info](
+                const std::string& robot_sphere_name,
+                const std::string& obstacle_name,
+                bool obstacle_is_dynamic,
+                double signed_distance) {
+                if (!nearest_distance_info->available ||
+                    signed_distance < nearest_distance_info->signed_distance) {
+                    nearest_distance_info->available = true;
+                    nearest_distance_info->signed_distance = signed_distance;
+                    nearest_distance_info->robot_sphere_name = robot_sphere_name;
+                    nearest_distance_info->obstacle_name = obstacle_name;
+                    nearest_distance_info->obstacle_is_dynamic = obstacle_is_dynamic;
+                }
+            };
+
+        for (const auto& robot_sphere : robot_collision_spheres_) {
+            const auto& sphere_transform = pin_data_->oMf[robot_sphere.frame_id];
+            const Vec3 sphere_center =
+                sphere_transform.translation() + sphere_transform.rotation() * robot_sphere.offset;
+
+            for (const auto& obstacle : scene_obstacles_) {
+                const double signed_distance =
+                    (sphere_center - obstacle.center).norm() - (robot_sphere.radius + obstacle.radius);
+                try_update_min_distance(
+                    robot_sphere.name,
+                    obstacle.name,
+                    false,
+                    signed_distance);
+            }
+
+            if (!use_dynamic_obstacles) {
+                continue;
+            }
+
+            for (const auto& obstacle : dynamic_obstacles) {
+                const double signed_distance =
+                    (sphere_center - obstacle.center).norm() - (robot_sphere.radius + obstacle.radius);
+                try_update_min_distance(
+                    robot_sphere.name,
+                    obstacle.name,
+                    true,
+                    signed_distance);
+            }
+        }
+    }
+
+    // Compute the current end-effector pose from the latest joint measurement.
+    void computeCurrentEePose(Vec3& ee_pos, Mat3& ee_rot) {
+        computeEePoseForConfiguration(q_meas_, ee_pos, ee_rot);
     }
 
     // Seed the second-order reference regulators from the measured EE pose so
@@ -635,12 +978,248 @@ private:
         return params;
     }
 
+    double posePathMetric(
+        const Vec3& pos_a,
+        const Mat3& rot_a,
+        const Vec3& pos_b,
+        const Mat3& rot_b) const {
+        return (pos_a - pos_b).norm() +
+               params_.path_following.rotation_metric_weight * rotationAngularDistance(rot_a, rot_b);
+    }
+
+    bool findOrderedJointIndices(
+        const std::vector<std::string>& joint_names,
+        std::array<std::size_t, 7>& indices) const {
+        for (std::size_t joint = 0; joint < ordered_names_.size(); ++joint) {
+            const auto it = std::find(joint_names.begin(), joint_names.end(), ordered_names_[joint]);
+            if (it == joint_names.end()) {
+                return false;
+            }
+            indices[joint] = static_cast<std::size_t>(std::distance(joint_names.begin(), it));
+        }
+        return true;
+    }
+
+    Vec7 extractOrderedJointPosition(
+        const trajectory_msgs::msg::JointTrajectoryPoint& point,
+        const std::array<std::size_t, 7>& indices) const {
+        Vec7 q = Vec7::Zero();
+        for (std::size_t joint = 0; joint < ordered_names_.size(); ++joint) {
+            q(static_cast<Eigen::Index>(joint)) = point.positions[indices[joint]];
+        }
+        return q;
+    }
+
+    std::shared_ptr<JointPathReference> buildJointPathFromTrajectory(
+        const trajectory_msgs::msg::JointTrajectory& trajectory) {
+        if (trajectory.points.empty()) {
+            return nullptr;
+        }
+
+        std::array<std::size_t, 7> joint_indices{};
+        if (!findOrderedJointIndices(trajectory.joint_names, joint_indices)) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Received JointTrajectory that does not contain the expected Panda joint names. Path update is ignored.");
+            return nullptr;
+        }
+
+        auto path = std::make_shared<JointPathReference>();
+        path->waypoints.reserve(trajectory.points.size());
+
+        for (const auto& point : trajectory.points) {
+            if (point.positions.size() < ordered_names_.size()) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Ignoring JointTrajectory point with %zu positions; expected at least %zu.",
+                    point.positions.size(),
+                    ordered_names_.size());
+                return nullptr;
+            }
+
+            PathWaypoint waypoint;
+            waypoint.q = extractOrderedJointPosition(point, joint_indices);
+            computeEePoseForConfiguration(waypoint.q, waypoint.ee_pos, waypoint.ee_rot);
+
+            if (path->waypoints.empty()) {
+                waypoint.path_s = 0.0;
+                path->waypoints.push_back(waypoint);
+                continue;
+            }
+
+            const auto& previous = path->waypoints.back();
+            waypoint.path_s = previous.path_s +
+                              posePathMetric(previous.ee_pos, previous.ee_rot, waypoint.ee_pos, waypoint.ee_rot);
+            path->waypoints.push_back(waypoint);
+        }
+
+        if (path->waypoints.empty()) {
+            return nullptr;
+        }
+
+        path->terminal_q = path->waypoints.back().q;
+        path->total_path_s = path->waypoints.back().path_s;
+        return path;
+    }
+
+    double computeEffectivePathStageSpacing() const {
+        return std::min(
+            params_.path_following.desired_stage_spacing,
+            params_.path_following.max_stage_average_speed * nmpc_solver_.getDt());
+    }
+
+    std::size_t findClosestPathWaypointIndex(
+        const JointPathReference& path,
+        const Vec3& ee_pos,
+        const Mat3& ee_rot,
+        std::size_t start_hint) const {
+        if (path.waypoints.empty()) {
+            return 0;
+        }
+
+        const std::size_t clamped_start_hint =
+            std::min(start_hint, path.waypoints.size() - 1);
+        std::size_t best_index = clamped_start_hint;
+        double best_metric = std::numeric_limits<double>::infinity();
+        for (std::size_t idx = clamped_start_hint; idx < path.waypoints.size(); ++idx) {
+            const auto& waypoint = path.waypoints[idx];
+            const double metric =
+                posePathMetric(ee_pos, ee_rot, waypoint.ee_pos, waypoint.ee_rot);
+            if (metric < best_metric) {
+                best_metric = metric;
+                best_index = idx;
+            }
+        }
+        return best_index;
+    }
+
+    PathWaypoint interpolatePathWaypoint(
+        const JointPathReference& path,
+        double query_s,
+        std::size_t& segment_index_hint) const {
+        if (path.waypoints.empty()) {
+            return PathWaypoint{};
+        }
+        if (query_s <= 0.0 || path.waypoints.size() == 1) {
+            return path.waypoints.front();
+        }
+        if (query_s >= path.total_path_s) {
+            return path.waypoints.back();
+        }
+
+        const std::size_t max_segment_index = path.waypoints.size() - 2;
+        segment_index_hint = std::min(segment_index_hint, max_segment_index);
+        while (segment_index_hint < max_segment_index &&
+               path.waypoints[segment_index_hint + 1].path_s < query_s) {
+            ++segment_index_hint;
+        }
+        while (segment_index_hint > 0 &&
+               path.waypoints[segment_index_hint].path_s > query_s) {
+            --segment_index_hint;
+        }
+
+        const auto& waypoint_a = path.waypoints[segment_index_hint];
+        const auto& waypoint_b = path.waypoints[segment_index_hint + 1];
+        const double segment_length =
+            std::max(1.0e-9, waypoint_b.path_s - waypoint_a.path_s);
+        const double alpha =
+            std::clamp((query_s - waypoint_a.path_s) / segment_length, 0.0, 1.0);
+
+        PathWaypoint interpolated;
+        interpolated.path_s = query_s;
+        interpolated.q = (1.0 - alpha) * waypoint_a.q + alpha * waypoint_b.q;
+        computeEePoseForConfiguration(interpolated.q, interpolated.ee_pos, interpolated.ee_rot);
+        return interpolated;
+    }
+
+    PathReferenceSample samplePathReferenceAtS(
+        const JointPathReference& path,
+        double query_s,
+        const Vec3& final_target_pos,
+        const Mat3& final_target_rot,
+        std::size_t& segment_index_hint) const {
+        PathReferenceSample sample;
+        if (query_s <= path.total_path_s || path.waypoints.empty()) {
+            const PathWaypoint waypoint = interpolatePathWaypoint(path, query_s, segment_index_hint);
+            sample.q_nom = waypoint.q;
+            sample.ee_pos = waypoint.ee_pos;
+            sample.ee_rot = waypoint.ee_rot;
+            return sample;
+        }
+
+        sample.q_nom = path.terminal_q;
+        sample.ee_pos = final_target_pos;
+        sample.ee_rot = final_target_rot;
+        return sample;
+    }
+
+    Vec3 approximateAngularVelocity(
+        const Mat3& current_rot,
+        const Mat3& next_rot,
+        double dt) const {
+        const Mat3 rotation_delta = current_rot.transpose() * next_rot;
+        Eigen::AngleAxisd angle_axis(rotation_delta);
+        if (!std::isfinite(angle_axis.angle()) || angle_axis.angle() < 1.0e-9) {
+            return Vec3::Zero();
+        }
+        const Vec3 omega_local = angle_axis.axis() * (angle_axis.angle() / std::max(dt, 1.0e-6));
+        return current_rot * omega_local;
+    }
+
+    PathTrackingSnapshot snapshotPathTrackingState() const {
+        PathTrackingSnapshot snapshot;
+        snapshot.active_path = active_joint_path_;
+        snapshot.state = path_tracking_state_;
+        snapshot.reference_head_s = path_reference_head_s_;
+        snapshot.closest_index_hint = path_closest_index_hint_;
+        snapshot.terminal_q_nominal = path_terminal_q_nominal_;
+        snapshot.waiting_for_fresh_path = waiting_for_fresh_path_after_target_update_;
+        snapshot.last_target_pose_update_stamp = last_target_pose_update_stamp_;
+        snapshot.latched_wait_target_pos = latched_wait_target_pos_;
+        snapshot.latched_wait_target_rot = latched_wait_target_rot_;
+        snapshot.latched_wait_q_nominal = latched_wait_q_nominal_;
+        snapshot.latched_wait_reference_valid = latched_wait_reference_valid_;
+        return snapshot;
+    }
+
+    void resetPathTrackingStateLocked() {
+        active_joint_path_.reset();
+        path_tracking_state_ = PathTrackingState::kTargetOnly;
+        path_reference_head_s_ = 0.0;
+        path_closest_index_hint_ = 0;
+        path_terminal_q_nominal_ = q_nominal_;
+    }
+
+    void commitPathTrackingStateIfUnchanged(
+        const PathTrackingSnapshot& snapshot,
+        PathTrackingState updated_state,
+        double updated_reference_head_s,
+        std::size_t updated_closest_index_hint) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (active_joint_path_.get() != snapshot.active_path.get()) {
+            return;
+        }
+
+        if (updated_state == PathTrackingState::kTargetOnly) {
+            resetPathTrackingStateLocked();
+            return;
+        }
+
+        path_reference_head_s_ = updated_reference_head_s;
+        path_closest_index_hint_ = updated_closest_index_hint;
+        path_tracking_state_ = updated_state;
+        path_terminal_q_nominal_ =
+            snapshot.active_path ? snapshot.active_path->terminal_q : q_nominal_;
+    }
+
     // Build a horizon of single-target references. Every stage shares the same
     // filtered task-space target, while obstacle parameters can vary by stage.
-    const std::vector<NMPCStageReference>& buildSingleTargetStageReferences(
+    const std::vector<NMPCStageReference>& buildUniformStageReferences(
         const Vec3& filtered_target_pos,
         const Mat3& filtered_target_rot,
         const Vec7& q_nominal,
+        const Vec3& ee_lin_vel_ref,
+        const Vec3& ee_ang_vel_ref,
         const std::vector<DynamicSphereState>& dynamic_obstacles,
         bool dynamic_obstacles_ready,
         const rclcpp::Time& dynamic_obstacle_stamp) {
@@ -650,8 +1229,6 @@ private:
             stage_refs_buffer_.resize(stage_count);
         }
 
-        const Vec3 ee_lin_vel_ref = sorr_pos_.getLinearVelocity();
-        const Vec3 ee_ang_vel_ref = sorr_rot_.getAngularVelocity();
         for (std::size_t stage = 0; stage < stage_count; ++stage) {
             auto& stage_ref = stage_refs_buffer_[stage];
             stage_ref.target_pos = filtered_target_pos;
@@ -665,6 +1242,59 @@ private:
                 dynamic_obstacles_ready,
                 dynamic_obstacle_stamp);
         }
+        return stage_refs_buffer_;
+    }
+
+    const std::vector<NMPCStageReference>& buildPathTrackingStageReferences(
+        const JointPathReference& path,
+        double reference_head_s,
+        const Vec3& final_target_pos,
+        const Mat3& final_target_rot,
+        const std::vector<DynamicSphereState>& dynamic_obstacles,
+        bool dynamic_obstacles_ready,
+        const rclcpp::Time& dynamic_obstacle_stamp) {
+
+        const std::size_t stage_count = static_cast<std::size_t>(nmpc_solver_.getN() + 1);
+        if (stage_refs_buffer_.size() != stage_count) {
+            stage_refs_buffer_.resize(stage_count);
+        }
+
+        const double stage_spacing = computeEffectivePathStageSpacing();
+        const double dt = nmpc_solver_.getDt();
+        const double total_reference_length =
+            path.total_path_s + params_.path_following.terminal_target_segment_length;
+
+        std::vector<PathReferenceSample> reference_samples(stage_count + 1);
+        std::size_t segment_index_hint = 0;
+        for (std::size_t sample_idx = 0; sample_idx < reference_samples.size(); ++sample_idx) {
+            const double query_s = std::clamp(
+                reference_head_s + static_cast<double>(sample_idx) * stage_spacing,
+                0.0,
+                total_reference_length);
+            reference_samples[sample_idx] = samplePathReferenceAtS(
+                path,
+                query_s,
+                final_target_pos,
+                final_target_rot,
+                segment_index_hint);
+        }
+
+        for (std::size_t stage = 0; stage < stage_count; ++stage) {
+            auto& stage_ref = stage_refs_buffer_[stage];
+            const auto& current = reference_samples[stage];
+            const auto& next = reference_samples[stage + 1];
+            stage_ref.target_pos = current.ee_pos;
+            stage_ref.target_rot = current.ee_rot;
+            stage_ref.q_nom = current.q_nom;
+            stage_ref.ee_lin_vel_ref = (next.ee_pos - current.ee_pos) / std::max(dt, 1.0e-6);
+            stage_ref.ee_ang_vel_ref = approximateAngularVelocity(current.ee_rot, next.ee_rot, dt);
+            stage_ref.obstacle_params = buildObstacleParamsForStage(
+                static_cast<int>(stage),
+                dynamic_obstacles,
+                dynamic_obstacles_ready,
+                dynamic_obstacle_stamp);
+        }
+
         return stage_refs_buffer_;
     }
 
@@ -689,7 +1319,9 @@ private:
                params_.acados_debug.period_sec;
     }
 
-    void maybeLogAcadosDebug(const int solve_status) {
+    void maybeLogAcadosDebug(
+        const int solve_status,
+        const NearestObstacleDistanceInfo* nearest_distance_info = nullptr) {
         if (!shouldLogAcadosDebug(solve_status)) {
             return;
         }
@@ -709,7 +1341,12 @@ private:
         const std::string subsection_divider =
             "----------------------------------------------------------------------";
         const int solver_status = debug_info.solver_status;
+        const std::string report_prefix =
+            (solver_status == 0)
+                ? ">>> [INFO][ACADOS_NMPC_DEBUG] <<<"
+                : "!!! [WARN][ACADOS_NMPC_DEBUG] !!!";
 
+        stream << report_prefix << '\n';
         stream << divider << '\n';
         stream << "ACADOS NMPC DEBUG REPORT\n";
         stream << subsection_divider << '\n';
@@ -744,6 +1381,38 @@ private:
             stream,
             "Soft Constraint Activation Threshold",
             params_.acados_debug.slack_activation_threshold);
+        if (params_.obstacle_distance_monitor.include_in_acados_report) {
+            if (nearest_distance_info != nullptr && nearest_distance_info->available) {
+                appendDebugLine(
+                    stream,
+                    "Nearest Sphere-Obstacle Clearance [m]",
+                    nearest_distance_info->signed_distance);
+                appendDebugLine(
+                    stream,
+                    "Nearest Sphere Pair",
+                    nearest_distance_info->robot_sphere_name + " <-> " +
+                        (nearest_distance_info->obstacle_is_dynamic ? "dynamic:" : "static:") +
+                        nearest_distance_info->obstacle_name);
+            } else {
+                appendDebugLine(
+                    stream,
+                    "Nearest Sphere-Obstacle Clearance [m]",
+                    "not available");
+            }
+
+            if (std::isfinite(min_recorded_nearest_obstacle_distance_)) {
+                appendDebugLine(
+                    stream,
+                    "Minimum Recorded Sphere-Obstacle Clearance [m]",
+                    min_recorded_nearest_obstacle_distance_);
+                appendDebugLine(
+                    stream,
+                    "Minimum Recorded Sphere Pair",
+                    min_recorded_robot_sphere_name_ + " <-> " +
+                        (min_recorded_obstacle_is_dynamic_ ? "dynamic:" : "static:") +
+                        min_recorded_obstacle_name_);
+            }
+        }
 
         if (params_.acados_debug.include_stage_slack_summary &&
             !debug_info.stage_slack_info.empty()) {
@@ -792,6 +1461,24 @@ private:
         }
     }
 
+    void recordNearestDistanceMinimum(
+        const NearestObstacleDistanceInfo& nearest_distance_info) {
+        if (!nearest_distance_info.available) {
+            return;
+        }
+
+        constexpr double kDistanceUpdateEpsilon = 1.0e-9;
+        if (nearest_distance_info.signed_distance >=
+            min_recorded_nearest_obstacle_distance_ - kDistanceUpdateEpsilon) {
+            return;
+        }
+
+        min_recorded_nearest_obstacle_distance_ = nearest_distance_info.signed_distance;
+        min_recorded_robot_sphere_name_ = nearest_distance_info.robot_sphere_name;
+        min_recorded_obstacle_name_ = nearest_distance_info.obstacle_name;
+        min_recorded_obstacle_is_dynamic_ = nearest_distance_info.obstacle_is_dynamic;
+    }
+
     // =========================================================================
     // Result Publication and Main Control Loop
     // =========================================================================
@@ -807,13 +1494,13 @@ private:
         nmpc_res_pub_->publish(msg);
     }
 
-    NMPCResult buildSafeHoldResult(const Vec7& q_meas) const {
+    NMPCResult buildHoldResult(const Vec7& q_meas, int status_code) const {
         NMPCResult result;
         result.q_ref = q_meas;
         result.v_ref.setZero();
         result.a_ref.setZero();
         result.jerk_cmd.setZero();
-        result.status = -999;
+        result.status = status_code;
         return result;
     }
 
@@ -828,6 +1515,7 @@ private:
         std::vector<DynamicSphereState> dynamic_obstacles;
         rclcpp::Time dynamic_obstacle_stamp(0, 0, RCL_ROS_TIME);
         bool dynamic_obstacles_ready = false;
+        PathTrackingSnapshot path_snapshot;
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -843,11 +1531,46 @@ private:
             dynamic_obstacles = dynamic_obstacles_;
             dynamic_obstacles_ready = dynamic_obstacles_ready_;
             dynamic_obstacle_stamp = dynamic_obstacle_stamp_;
+            path_snapshot = snapshotPathTrackingState();
+        }
+
+        const bool dynamic_obstacles_fresh =
+            params_.dynamic_obstacles.enabled &&
+            dynamic_obstacles_ready &&
+            hasFreshDynamicObstacles(dynamic_obstacle_stamp, dynamic_obstacles_ready);
+        const bool should_monitor_nearest_distance =
+            params_.obstacle_distance_monitor.enabled &&
+            ((nearest_obstacle_distance_pub_ != nullptr &&
+              nearest_obstacle_distance_pub_->get_subscription_count() > 0) ||
+             params_.obstacle_distance_monitor.include_in_acados_report);
+
+        Vec3 current_ee_pos = Vec3::Zero();
+        Mat3 current_ee_rot = Mat3::Identity();
+        NearestObstacleDistanceInfo nearest_distance_info;
+        computeCurrentGeometrySnapshot(
+            q_meas,
+            current_ee_pos,
+            current_ee_rot,
+            dynamic_obstacles,
+            dynamic_obstacles_fresh,
+            should_monitor_nearest_distance ? &nearest_distance_info : nullptr);
+
+        if (should_monitor_nearest_distance &&
+            nearest_obstacle_distance_pub_ != nullptr &&
+            nearest_obstacle_distance_pub_->get_subscription_count() > 0 &&
+            nearest_distance_info.available) {
+            Float64Msg distance_msg;
+            distance_msg.data = nearest_distance_info.signed_distance;
+            nearest_obstacle_distance_pub_->publish(distance_msg);
+        }
+
+        if (should_monitor_nearest_distance) {
+            recordNearestDistanceMinimum(nearest_distance_info);
         }
 
         if (params_.dynamic_obstacles.enabled &&
             dynamic_obstacles_ready &&
-            !hasFreshDynamicObstacles(dynamic_obstacle_stamp, dynamic_obstacles_ready)) {
+            !dynamic_obstacles_fresh) {
             const double age_sec = (this->now() - dynamic_obstacle_stamp).seconds();
             const double timeout_sec = params_.dynamic_obstacles.timeout_sec;
             const std::size_t obstacle_count = dynamic_obstacles.size();
@@ -858,26 +1581,148 @@ private:
                 age_sec, timeout_sec, obstacle_count);
         }
 
-        const Vec3 filtered_target_pos = sorr_pos_.updatePosition(target_pos);
-        const Quat filtered_target_quat = sorr_rot_.updateOrientation(target_rot);
-        const Mat3 filtered_target_rot = filtered_target_quat.toRotationMatrix();
+        const double dt = nmpc_solver_.getDt();
+        const double total_terminal_length = params_.path_following.terminal_target_segment_length;
+        SecondOrderReferenceRegulator candidate_sorr_pos = sorr_pos_;
+        SecondOrderReferenceRegulator candidate_sorr_rot = sorr_rot_;
 
-        const NMPCResult result = nmpc_solver_.NMPCSolveStageReferences(
-            buildSingleTargetStageReferences(
+        bool use_path_tracking = false;
+        bool use_waiting_reference = false;
+        bool reset_sorr_from_current_pose = false;
+        PathTrackingState updated_path_state = path_snapshot.state;
+        double updated_reference_head_s = path_snapshot.reference_head_s;
+        std::size_t updated_closest_index_hint = path_snapshot.closest_index_hint;
+
+        if (params_.use_global_trajectory &&
+            params_.path_following.enabled &&
+            path_snapshot.waiting_for_fresh_path) {
+            if (!path_snapshot.latched_wait_reference_valid) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Waiting for a fresh /global_joint_trajectory after a target update, but no latched wait reference is available. Falling back to a direct hold command.");
+                consecutive_failure_count_ = 0;
+                publishResult(buildHoldResult(q_meas, -998));
+                return;
+            }
+
+            use_waiting_reference = true;
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "A new target pose has arrived and NMPC is waiting for a fresh /global_joint_trajectory. Solving against the latched current EE pose until MoveIt publishes the new path.");
+        }
+
+        if (!use_waiting_reference &&
+            params_.use_global_trajectory &&
+            params_.path_following.enabled &&
+            path_snapshot.active_path) {
+            if (updated_path_state == PathTrackingState::kFollowingPath) {
+                updated_closest_index_hint = findClosestPathWaypointIndex(
+                    *path_snapshot.active_path,
+                    current_ee_pos,
+                    current_ee_rot,
+                    updated_closest_index_hint);
+
+                const double projected_path_s =
+                    path_snapshot.active_path->waypoints[updated_closest_index_hint].path_s;
+                const double desired_head_s = projected_path_s + params_.path_following.lookahead_distance;
+                const double limited_head_s =
+                    std::min(desired_head_s, updated_reference_head_s +
+                                                params_.path_following.max_head_advance_speed * dt);
+                updated_reference_head_s = std::max(projected_path_s, limited_head_s);
+
+                if (updated_reference_head_s >=
+                    path_snapshot.active_path->total_path_s + total_terminal_length -
+                        params_.path_following.completion_path_tolerance) {
+                    updated_path_state = PathTrackingState::kTerminalTarget;
+                }
+            }
+
+            if (updated_path_state == PathTrackingState::kTerminalTarget) {
+                const double target_position_error = (current_ee_pos - target_pos).norm();
+                const double target_orientation_error =
+                    rotationAngularDistance(current_ee_rot, target_rot);
+                if (target_position_error <= params_.path_following.completion_position_tolerance &&
+                    target_orientation_error <= params_.path_following.completion_orientation_tolerance) {
+                    updated_path_state = PathTrackingState::kTargetOnly;
+                    reset_sorr_from_current_pose = true;
+                }
+            }
+
+            use_path_tracking = updated_path_state == PathTrackingState::kFollowingPath;
+        }
+
+        if (reset_sorr_from_current_pose) {
+            candidate_sorr_pos.resetPosition(current_ee_pos);
+            candidate_sorr_rot.resetOrientation(Quat(current_ee_rot));
+        }
+
+        const std::vector<NMPCStageReference>* stage_refs = nullptr;
+        if (use_waiting_reference) {
+            stage_refs = &buildUniformStageReferences(
+                path_snapshot.latched_wait_target_pos,
+                path_snapshot.latched_wait_target_rot,
+                path_snapshot.latched_wait_q_nominal,
+                Vec3::Zero(),
+                Vec3::Zero(),
+                dynamic_obstacles,
+                dynamic_obstacles_ready,
+                dynamic_obstacle_stamp);
+        } else if (use_path_tracking && path_snapshot.active_path) {
+            stage_refs = &buildPathTrackingStageReferences(
+                *path_snapshot.active_path,
+                updated_reference_head_s,
+                target_pos,
+                target_rot,
+                dynamic_obstacles,
+                dynamic_obstacles_ready,
+                dynamic_obstacle_stamp);
+        } else if (updated_path_state == PathTrackingState::kTerminalTarget &&
+                   path_snapshot.active_path) {
+            stage_refs = &buildUniformStageReferences(
+                target_pos,
+                target_rot,
+                path_snapshot.active_path->terminal_q,
+                Vec3::Zero(),
+                Vec3::Zero(),
+                dynamic_obstacles,
+                dynamic_obstacles_ready,
+                dynamic_obstacle_stamp);
+        } else {
+            const Vec3 filtered_target_pos = candidate_sorr_pos.updatePosition(target_pos);
+            const Quat filtered_target_quat = candidate_sorr_rot.updateOrientation(target_rot);
+            const Mat3 filtered_target_rot = filtered_target_quat.toRotationMatrix();
+            stage_refs = &buildUniformStageReferences(
                 filtered_target_pos,
                 filtered_target_rot,
                 q_nominal,
+                candidate_sorr_pos.getLinearVelocity(),
+                candidate_sorr_rot.getAngularVelocity(),
                 dynamic_obstacles,
                 dynamic_obstacles_ready,
-                dynamic_obstacle_stamp),
+                dynamic_obstacle_stamp);
+        }
+
+        const NMPCResult result = nmpc_solver_.NMPCSolveStageReferences(
+            *stage_refs,
             q_meas,
             dq_meas);
 
-        maybeLogAcadosDebug(result.status);
+        maybeLogAcadosDebug(
+            result.status,
+            should_monitor_nearest_distance ? &nearest_distance_info : nullptr);
 
         if (result.status == 0) {
             consecutive_failure_count_ = 0;
             last_valid_result_ = result;
+            if (path_snapshot.active_path) {
+                commitPathTrackingStateIfUnchanged(
+                    path_snapshot,
+                    updated_path_state,
+                    updated_reference_head_s,
+                    updated_closest_index_hint);
+            }
+            sorr_pos_ = candidate_sorr_pos;
+            sorr_rot_ = candidate_sorr_rot;
             publishResult(result);
             return;
         }
@@ -894,7 +1739,7 @@ private:
             return;
         }
 
-        publishResult(buildSafeHoldResult(q_meas));
+        publishResult(buildHoldResult(q_meas, -999));
     }
 
     // =========================================================================
@@ -1018,9 +1863,50 @@ private:
             return;
         }
 
+        const rclcpp::Time target_update_stamp = this->now();
+        const Mat3 normalized_target_rot = quat.normalized().toRotationMatrix();
+
+        bool should_wait_for_fresh_path = false;
+        bool have_latched_wait_reference = false;
+        Vec7 latched_wait_q = Vec7::Zero();
+        Vec3 latched_wait_pos = Vec3::Zero();
+        Mat3 latched_wait_rot = Mat3::Identity();
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            should_wait_for_fresh_path =
+                params_.use_global_trajectory &&
+                params_.path_following.enabled &&
+                params_.path_following.wait_for_fresh_path_after_target_update;
+            if (should_wait_for_fresh_path && joint_state_ready_) {
+                latched_wait_q = q_meas_;
+                have_latched_wait_reference = true;
+            }
+        }
+
+        if (have_latched_wait_reference) {
+            computeEePoseForConfiguration(latched_wait_q, latched_wait_pos, latched_wait_rot);
+        }
+
         std::lock_guard<std::mutex> lock(state_mutex_);
         target_pos_ = position;
-        target_rot_ = quat.normalized().toRotationMatrix();
+        target_rot_ = normalized_target_rot;
+        last_target_pose_update_stamp_ = target_update_stamp;
+
+        if (should_wait_for_fresh_path) {
+            resetPathTrackingStateLocked();
+            waiting_for_fresh_path_after_target_update_ = true;
+            latched_wait_reference_valid_ = have_latched_wait_reference;
+            if (have_latched_wait_reference) {
+                latched_wait_target_pos_ = latched_wait_pos;
+                latched_wait_target_rot_ = latched_wait_rot;
+                latched_wait_q_nominal_ = latched_wait_q;
+            } else {
+                latched_wait_target_pos_ = position;
+                latched_wait_target_rot_ = normalized_target_rot;
+                latched_wait_q_nominal_ = q_nominal_;
+            }
+        }
     }
 
     // Cache the latest moving obstacles so the timer loop can do stage-wise
@@ -1098,12 +1984,86 @@ private:
         //     this->get_logger(), *this->get_clock(), 2000, "%s", stream.str().c_str());
     }
 
-    // The node keeps this subscription only for interface compatibility. The
-    // current implementation is intentionally single-target only.
-    void jointTrajectoryCallback(const trajectory_msgs::msg::JointTrajectory::SharedPtr /*msg*/) {
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "This NMPC node is single-pose only. /global_joint_trajectory is intentionally ignored.");
+    void jointTrajectoryCallback(const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) {
+        if (!params_.use_global_trajectory || !params_.path_following.enabled) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 2000,
+                "Received /global_joint_trajectory but path following is disabled. Set use_global_trajectory=true and path_following.enabled=true to consume MoveIt paths.");
+            return;
+        }
+
+        const rclcpp::Time trajectory_stamp =
+            (msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0)
+                ? this->now()
+                : rclcpp::Time(msg->header.stamp);
+
+        const auto path = buildJointPathFromTrajectory(*msg);
+        if (!path || path->waypoints.empty()) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 2000,
+                "Received an invalid or empty JointTrajectory. Path update is ignored.");
+            return;
+        }
+
+        Vec3 current_ee_pos = Vec3::Zero();
+        Mat3 current_ee_rot = Mat3::Identity();
+        Vec7 current_q = Vec7::Zero();
+        bool have_current_state = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (joint_state_ready_) {
+                have_current_state = true;
+                current_q = q_meas_;
+            }
+        }
+        if (have_current_state) {
+            computeEePoseForConfiguration(current_q, current_ee_pos, current_ee_rot);
+        }
+
+        std::size_t initial_closest_index = 0;
+        double initial_projected_s = 0.0;
+        if (have_current_state) {
+            initial_closest_index = findClosestPathWaypointIndex(*path, current_ee_pos, current_ee_rot, 0);
+            initial_projected_s = path->waypoints[initial_closest_index].path_s;
+        }
+
+        bool rejected_as_stale = false;
+        rclcpp::Time latest_target_stamp(0, 0, RCL_ROS_TIME);
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            latest_target_stamp = last_target_pose_update_stamp_;
+            if (waiting_for_fresh_path_after_target_update_ &&
+                params_.path_following.wait_for_fresh_path_after_target_update &&
+                trajectory_stamp < last_target_pose_update_stamp_) {
+                rejected_as_stale = true;
+            }
+            if (!rejected_as_stale) {
+                active_joint_path_ = path;
+                path_tracking_state_ = PathTrackingState::kFollowingPath;
+                path_closest_index_hint_ = initial_closest_index;
+                path_reference_head_s_ = std::max(
+                    0.0,
+                    initial_projected_s + params_.path_following.lookahead_distance);
+                path_terminal_q_nominal_ = path->terminal_q;
+                waiting_for_fresh_path_after_target_update_ = false;
+            }
+        }
+
+        if (rejected_as_stale) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Ignored a stale /global_joint_trajectory (stamp=%.3f) because the latest target pose was updated at %.3f and NMPC is waiting for a fresh path.",
+                trajectory_stamp.seconds(),
+                latest_target_stamp.seconds());
+            return;
+        }
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Loaded global joint path with %zu waypoint(s), path_length=%.4f, initial_head_s=%.4f, terminal_q_from_path=true",
+            path->waypoints.size(),
+            path->total_path_s,
+            initial_projected_s + params_.path_following.lookahead_distance);
     }
 
 public:
@@ -1123,6 +2083,7 @@ public:
 
         target_pos_ = params_.target_pos;
         target_rot_ = params_.target_rot;
+        path_terminal_q_nominal_ = q_nominal_;
 
         // 3) Initialize model-side resources and reusable reference buffers.
         initializePinocchio();
@@ -1176,6 +2137,10 @@ public:
         // 6) Start the output publisher and fixed-rate control timer.
         nmpc_res_pub_ =
             this->create_publisher<panda_interfaces::msg::ResultNMPC>(params_.nmpc_result_topic, 1);
+        if (params_.obstacle_distance_monitor.enabled) {
+            nearest_obstacle_distance_pub_ =
+                this->create_publisher<Float64Msg>(params_.obstacle_distance_monitor.topic, 1);
+        }
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(static_cast<int64_t>(1000.0 * nmpc_solver_.getDt())),
             [this]() { timerCallback(); },
@@ -1183,7 +2148,7 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "NMPC single-pose node started. urdf=%s, ee_frame=%s, static_obstacle_source=%s, dynamic_obstacles=%s, dynamic_topic=%s, dynamic_prediction=%s, joint_states_topic=%s, target_pose_topic=%s, result_topic=%s, joint_trajectory_topic=%s (ignored), use_global_trajectory=%s (ignored), acados_debug=%s, executor=MultiThreadedExecutor",
+            "NMPC node started. urdf=%s, ee_frame=%s, static_obstacle_source=%s, dynamic_obstacles=%s, dynamic_topic=%s, dynamic_prediction=%s, joint_states_topic=%s, target_pose_topic=%s, result_topic=%s, joint_trajectory_topic=%s, use_global_trajectory=%s, path_following=%s, acados_debug=%s, nearest_obstacle_distance=%s, nearest_distance_topic=%s, executor=MultiThreadedExecutor",
             params_.urdf_path.c_str(),
             params_.ee_frame_name.c_str(),
             selectObstacleSourcePath().c_str(),
@@ -1195,7 +2160,10 @@ public:
             params_.nmpc_result_topic.c_str(),
             params_.joint_trajectory_topic.c_str(),
             params_.use_global_trajectory ? "true" : "false",
-            params_.acados_debug.enabled ? "enabled" : "disabled");
+            params_.path_following.enabled ? "enabled" : "disabled",
+            params_.acados_debug.enabled ? "enabled" : "disabled",
+            params_.obstacle_distance_monitor.enabled ? "enabled" : "disabled",
+            params_.obstacle_distance_monitor.topic.c_str());
     }
 };
 

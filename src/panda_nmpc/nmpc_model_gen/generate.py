@@ -418,9 +418,12 @@ def apply_solver_options(ocp: AcadosOcp, cfg: OcpConfig) -> None:
     ocp.solver_options.nlp_solver_max_iter = cfg.nlp_solver_max_iter
     ocp.solver_options.print_level = cfg.print_level
 
+    """
+    以下设置会导致计算速度显著下降
+    """
     ocp.solver_options.regularize_method = "PROJECT"
     ocp.solver_options.reg_adaptive_eps  = True
-    ocp.solver_options.hpipm_mode = "ROBUST"
+    ocp.solver_options.hpipm_mode = "SPEED"
 
 
 def build_default_runtime_parameters(scene_obstacles: list[StaticSphereObstacle], cfg: OcpConfig) -> np.ndarray:

@@ -19,6 +19,7 @@
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/display_trajectory.hpp>
 #include <moveit_msgs/srv/get_planning_scene.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2/LinearMath/Quaternion.h>
@@ -40,6 +41,8 @@ public:
 
     trajectory_pub_ =
         create_publisher<trajectory_msgs::msg::JointTrajectory>(trajectory_topic_, rclcpp::QoS(1).reliable());
+    display_trajectory_pub_ = create_publisher<moveit_msgs::msg::DisplayTrajectory>(
+        display_trajectory_topic_, rclcpp::QoS(1).reliable().transient_local());
 
     target_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         target_topic_, rclcpp::QoS(10),
@@ -121,6 +124,8 @@ private:
     planning_group_ = declare_parameter<std::string>("planning_group", "panda_arm");
     target_topic_ = declare_parameter<std::string>("target_topic", "/global_target_pose");
     trajectory_topic_ = declare_parameter<std::string>("trajectory_topic", "/global_joint_trajectory");
+    display_trajectory_topic_ = declare_parameter<std::string>(
+        "display_trajectory_topic", "/global_planning/display_trajectory");
 
     planning_time_ = declare_parameter<double>("planning_time", 3.0);
     num_planning_attempts_ = declare_parameter<int>("num_planning_attempts", 1);
@@ -677,6 +682,26 @@ private:
     return true;
   }
 
+  void publishSelectedDisplayTrajectory(
+      const moveit::planning_interface::MoveGroupInterface::Plan& plan,
+      std::uint64_t revision) {
+    if (!display_trajectory_pub_ || !move_group_) {
+      return;
+    }
+
+    moveit_msgs::msg::DisplayTrajectory display_msg;
+    display_msg.model_id = move_group_->getRobotModel()->getName();
+    display_msg.trajectory_start = plan.start_state_;
+    display_msg.trajectory.push_back(plan.trajectory_);
+    display_trajectory_pub_->publish(display_msg);
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Published final display trajectory for target revision=%llu on '%s'.",
+        static_cast<unsigned long long>(revision),
+        display_trajectory_topic_.c_str());
+  }
+
   bool isBetterCandidate(const PlanCandidate& lhs, const PlanCandidate& rhs) const {
     if (!lhs.valid) {
       return false;
@@ -830,6 +855,7 @@ private:
 
     trajectory.header.stamp = now();
     trajectory_pub_->publish(trajectory);
+    publishSelectedDisplayTrajectory(best_candidate.plan, revision);
 
     const auto total_duration = trajectory.points.back().time_from_start;
     RCLCPP_INFO(
@@ -851,6 +877,7 @@ private:
   std::unique_ptr<moveit::planning_interface::PlanningSceneInterface> planning_scene_interface_;
 
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr trajectory_pub_;
+  rclcpp::Publisher<moveit_msgs::msg::DisplayTrajectory>::SharedPtr display_trajectory_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr planning_scene_client_;
   rclcpp::TimerBase::SharedPtr init_timer_;
@@ -866,6 +893,7 @@ private:
   std::string planning_group_;
   std::string target_topic_;
   std::string trajectory_topic_;
+  std::string display_trajectory_topic_;
   std::string planner_id_;
   std::string target_frame_;
   std::string obstacle_config_path_;
