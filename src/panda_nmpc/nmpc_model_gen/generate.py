@@ -7,7 +7,7 @@
 1. 三阶积分器模型: x = [q, dq, ddq], u = jerk。
 2. 先只实现单点位姿跟踪；接口与数据结构保留到轨迹/路径扩展位。
 3. 不加入外部碰撞约束，但保留约束结构，后续可继续在 h / h_e 中扩展。
-4. 硬约束始终保留真实物理边界；额外通过“软舒适边界”做可切换的 soft handling。
+4. 当前导出的 hard-only 版本只保留真实物理边界；soft/path constraints 预留为后续扩展。
 5. 使用连续时间动力学 + acados 标准显式积分器接口，避免 disc_dyn_expr 与现有 API 不匹配。
 6. 主代价保持 NONLINEAR_LS + GAUSS_NEWTON，便于 SQP_RTI 实时求解。
 """
@@ -93,6 +93,7 @@ class OcpConfig:
     levenberg_marquardt: float = 1.0e-6
     limits: PandaLimits = field(default_factory=PandaLimits)
     weights: WeightConfig = field(default_factory=WeightConfig)
+    # 预留给未来 soft/path constraints；当前 hard-only 版本不使用。
     soft_penalty_stage: SoftConstraintPenalty = field(default_factory=SoftConstraintPenalty)
     soft_penalty_terminal: SoftConstraintPenalty = field(
         default_factory=lambda: SoftConstraintPenalty(slack_linear=2.0e3, slack_quadratic=2.0e6)
@@ -123,13 +124,12 @@ class OcpConfig:
 
     @property
     def nh(self) -> int:
-        # q upper/lower, dq upper/lower, ddq upper/lower, jerk upper/lower
-        return 56
+        # 当前 hard-only 版本不生成一般性 h 约束；后续若要恢复 soft/path constraints，再显式扩展。
+        return 0
 
     @property
     def nh_e(self) -> int:
-        # q upper/lower, dq upper/lower, ddq upper/lower
-        return 42
+        return 0
 
 
 def assert_fixed_base_7dof(model: pin.Model) -> None:
@@ -214,19 +214,6 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
         ddq - ddq_nom,
     )
 
-    # 软舒适边界：h(x,u) <= uh，lh = -inf。
-    h_expr = ca.vertcat(
-        q, -q,
-        dq, -dq,
-        ddq, -ddq,
-        jerk, -jerk,
-    )
-    h_expr_e = ca.vertcat(
-        q, -q,
-        dq, -dq,
-        ddq, -ddq,
-    )
-
     model = AcadosModel()
     model.name = cfg.solver_name
     model.x = x
@@ -237,8 +224,6 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
     model.f_impl_expr = f_impl
     model.cost_y_expr = cost_y
     model.cost_y_expr_e = cost_y_e
-    model.con_h_expr = h_expr
-    model.con_h_expr_e = h_expr_e
 
     ocp = AcadosOcp()
     ocp.model = model
@@ -295,22 +280,8 @@ def build_acados_ocp(urdf_path: str, ee_frame_name: str, cfg: OcpConfig) -> Acad
     ocp.constraints.lbu = -lim.jerk_max
     ocp.constraints.ubu = lim.jerk_max
 
-    ocp.constraints.lh = -1.0e15 * np.ones(cfg.nh, dtype=float)
-    ocp.constraints.uh = 1.0e15 * np.ones(cfg.nh, dtype=float)
-    ocp.constraints.lh_e = -1.0e15 * np.ones(cfg.nh_e, dtype=float)
-    ocp.constraints.uh_e = 1.0e15 * np.ones(cfg.nh_e, dtype=float)
-    ocp.constraints.idxsh = np.arange(cfg.nh, dtype=int)
-    ocp.constraints.idxsh_e = np.arange(cfg.nh_e, dtype=int)
-
-    ocp.cost.Zl = cfg.soft_penalty_stage.slack_quadratic * np.ones(cfg.nh, dtype=float)
-    ocp.cost.Zu = cfg.soft_penalty_stage.slack_quadratic * np.ones(cfg.nh, dtype=float)
-    ocp.cost.zl = cfg.soft_penalty_stage.slack_linear * np.ones(cfg.nh, dtype=float)
-    ocp.cost.zu = cfg.soft_penalty_stage.slack_linear * np.ones(cfg.nh, dtype=float)
-
-    ocp.cost.Zl_e = cfg.soft_penalty_terminal.slack_quadratic * np.ones(cfg.nh_e, dtype=float)
-    ocp.cost.Zu_e = cfg.soft_penalty_terminal.slack_quadratic * np.ones(cfg.nh_e, dtype=float)
-    ocp.cost.zl_e = cfg.soft_penalty_terminal.slack_linear * np.ones(cfg.nh_e, dtype=float)
-    ocp.cost.zu_e = cfg.soft_penalty_terminal.slack_linear * np.ones(cfg.nh_e, dtype=float)
+    # hard-only 版本中，q/dq/ddq 仅通过 lbx/ubx 生效，jerk 仅通过 lbu/ubu 生效。
+    # 不重复生成 h/h_e，也不生成任何 slack 变量。
 
     ocp.solver_options.qp_solver = cfg.qp_solver
     ocp.solver_options.qp_solver_cond_N = min(cfg.qp_solver_cond_N, cfg.horizon_steps)

@@ -153,8 +153,7 @@ public:
     void setConstraintConfig(const ConstraintConfig& config) {
         constraint_config_ = sanitizeConstraintConfig(config);
         applyHardLimits();
-        applySoftConstraintBounds();
-        applySoftConstraintPenalties();
+        // 当前 hard-only solver 不生成 h/slack；这里只下发 box hard bounds。
     }
 
     const ConstraintConfig& getConstraintConfig() const { return constraint_config_; }
