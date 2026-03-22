@@ -50,7 +50,7 @@ find_library(BLASFEO_LIB blasfeo PATHS ${ACADOS_DIR}/lib REQUIRED)
 
 # 直接用当前 workspace 中最新的 generated C 源码构建 solver 共享库，
 # 避免“头文件/生成源码已经更新，但旧的 .so 还没重新 make”导致的参数维度错位。
-file(GLOB_RECURSE GENERATED_C_SOURCES
+file(GLOB_RECURSE GENERATED_C_SOURCES CONFIGURE_DEPENDS
   "${GEN_CODE_DIR}/c_generated_code/*.c"
   "${GEN_CODE_DIR}/c_generated_code/**/*.c")
 list(FILTER GENERATED_C_SOURCES EXCLUDE REGEX "main_.*\\.c$")
