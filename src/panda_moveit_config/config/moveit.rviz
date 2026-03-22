@@ -4,6 +4,7 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /MotionPlanning1
+        - /InteractiveMarkers1
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -22,9 +23,31 @@ Visualization Manager:
       Planning Scene Topic: monitored_planning_scene
       Robot Description: robot_description
       Scene Geometry:
-        Scene Alpha: 1
+        Scene Alpha: 0
       Scene Robot:
         Robot Alpha: 0.5
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Obstacles
+      Namespaces:
+        dynamic_obstacles: true
+        static_obstacles: true
+      Topic:
+        Depth: 100
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /obstacle_markers
+      Value: true
+    - Class: rviz_default_plugins/InteractiveMarkers
+      Enable Transparency: true
+      Enabled: true
+      Interactive Markers Namespace: /target_pose_marker
+      Name: InteractiveMarkers
+      Show Axes: true
+      Show Descriptions: true
+      Show Visual Aids: true
       Value: true
   Global Options:
     Fixed Frame: link0

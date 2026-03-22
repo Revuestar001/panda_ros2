@@ -15,6 +15,7 @@
   <depend>moveit_msgs</depend>
   <depend>rclcpp</depend>
   <depend>moveit_ros_planning_interface</depend>
+  <depend>panda_nmpc</depend>
   <depend>panda_moveit_config</depend>
   <depend>shape_msgs</depend>
   <depend>std_srvs</depend>

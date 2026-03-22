@@ -257,12 +257,12 @@ def generate_launch_description():
     )
     start_target_pose_marker = DeclareLaunchArgument(
         "start_target_pose_marker",
-        default_value="true",
+        default_value="false",
         description="Start the RViz interactive target marker node.",
     )
     start_target_pose_marker_rviz = DeclareLaunchArgument(
         "start_target_pose_marker_rviz",
-        default_value="true",
+        default_value="false",
         description="Start RViz2 with the target marker config.",
     )
     target_pose_marker_params_file = DeclareLaunchArgument(
@@ -281,7 +281,7 @@ def generate_launch_description():
     )
     start_obstacle_marker_visualizer = DeclareLaunchArgument(
         "start_obstacle_marker_visualizer",
-        default_value="true",
+        default_value="false",
         description="Start the RViz obstacle marker visualizer node.",
     )
     obstacle_marker_visualizer_params_file = DeclareLaunchArgument(

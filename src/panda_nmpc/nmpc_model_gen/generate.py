@@ -418,6 +418,10 @@ def apply_solver_options(ocp: AcadosOcp, cfg: OcpConfig) -> None:
     ocp.solver_options.nlp_solver_max_iter = cfg.nlp_solver_max_iter
     ocp.solver_options.print_level = cfg.print_level
 
+    ocp.solver_options.regularize_method = "PROJECT"
+    ocp.solver_options.reg_adaptive_eps  = True
+    ocp.solver_options.hpipm_mode = "ROBUST"
+
 
 def build_default_runtime_parameters(scene_obstacles: list[StaticSphereObstacle], cfg: OcpConfig) -> np.ndarray:
     parameter_values = np.zeros(cfg.np_stage, dtype=float)

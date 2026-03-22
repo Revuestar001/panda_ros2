@@ -73,6 +73,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
     DESTINATION share/${PROJECT_NAME})
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config")
+  install(DIRECTORY config
+    DESTINATION share/${PROJECT_NAME})
+endif()
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

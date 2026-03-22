@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
-<robot name="panda">
+<robot name="panda" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="headless" default="false"/>
   <link name="link0">
     <visual>
       <geometry>
@@ -387,6 +388,7 @@
     <hardware>
       <plugin>mujoco_ros2_control/MujocoSystemInterface</plugin>
       <param name="mujoco_model">/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml</param>
+      <param name="headless">$(arg headless)</param>
     
       <param name="sim_speed_factor">1.0</param>
     

@@ -1,0 +1,30 @@
+global_planning_node:
+  ros__parameters:
+    use_sim_time: true
+
+    planning_group: "panda_arm"
+    planner_id: "RRTstarkConfigDefault"
+
+    target_topic: "/global_target_pose"
+    trajectory_topic: "/global_joint_trajectory"
+
+    planning_time: 6.0
+    num_planning_attempts: 2
+    max_multi_plan_rounds: 12
+    min_rounds_before_early_stop: 3
+
+    goal_position_tolerance: 0.0005
+    goal_orientation_tolerance: 0.005
+    accepted_terminal_position_error: 0.001
+    accepted_terminal_orientation_error: 0.01
+
+    target_frame: ""
+
+    use_multi_seed_ik: true
+    ik_timeout_per_seed: 0.03
+    current_state_wait_time: 0.2
+
+    obstacle_config_path: "/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml"
+    scene_xml_path: "/home/cyh/panda_ros2/model/franka_emika_panda/scene_tau_ros.xml"
+    scene_world_frame: "world"
+    obstacle_radius_padding: 0.05

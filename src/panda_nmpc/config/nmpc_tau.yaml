@@ -52,7 +52,7 @@ nmpc_tau_node:
         enabled: true
         period_sec: 1.0
         print_on_failure: true
-        slack_activation_threshold: 1.0e-3
+        slack_activation_threshold: 1.0e-4
         include_stage_slack_summary: true
         max_reported_stages: 4
 
