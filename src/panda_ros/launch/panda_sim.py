@@ -61,7 +61,16 @@ def launch_setup(context, *args, **kwargs):
     obstacle_config_path = LaunchConfiguration("obstacle_config_path").perform(context)
     scene_xml_path = LaunchConfiguration("scene_xml_path").perform(context)
     dynamic_obstacle_topic = LaunchConfiguration("dynamic_obstacle_topic")
+    target_pose_topic = LaunchConfiguration("target_pose_topic")
+    start_target_pose_marker = LaunchConfiguration("start_target_pose_marker")
+    start_target_pose_marker_rviz = LaunchConfiguration("start_target_pose_marker_rviz")
+    target_pose_marker_params_file = LaunchConfiguration("target_pose_marker_params_file")
+    target_pose_marker_rviz_config_file = LaunchConfiguration("target_pose_marker_rviz_config_file")
+    start_obstacle_marker_visualizer = LaunchConfiguration("start_obstacle_marker_visualizer")
+    obstacle_marker_visualizer_params_file = LaunchConfiguration("obstacle_marker_visualizer_params_file")
     dynamic_obstacle_publisher_params_file = LaunchConfiguration("dynamic_obstacle_publisher_params_file")
+    target_pose_marker_params = ParameterFile(target_pose_marker_params_file, allow_substs=True)
+    obstacle_marker_visualizer_params = ParameterFile(obstacle_marker_visualizer_params_file, allow_substs=True)
     sync_executable = os.path.join(
         get_package_prefix("panda_nmpc"),
         "lib",
@@ -152,6 +161,50 @@ def launch_setup(context, *args, **kwargs):
     nodes.append(
         Node(
             package="panda_nmpc",
+            executable="interactive_target_marker_node",
+            output="both",
+            parameters=[
+                target_pose_marker_params,
+                {
+                    "use_sim_time": True,
+                    "target_pose_topic": target_pose_topic,
+                },
+            ],
+            condition=IfCondition(start_target_pose_marker),
+        )
+    )
+
+    nodes.append(
+        Node(
+            package="rviz2",
+            executable="rviz2",
+            output="both",
+            arguments=["-d", target_pose_marker_rviz_config_file],
+            parameters=[{"use_sim_time": True}],
+            condition=IfCondition(start_target_pose_marker_rviz),
+        )
+    )
+
+    nodes.append(
+        Node(
+            package="panda_nmpc",
+            executable="obstacle_marker_visualizer_node",
+            output="both",
+            parameters=[
+                obstacle_marker_visualizer_params,
+                {
+                    "use_sim_time": True,
+                    "obstacle_config_path": obstacle_config_path,
+                    "dynamic_obstacle_topic": dynamic_obstacle_topic,
+                },
+            ],
+            condition=IfCondition(start_obstacle_marker_visualizer),
+        )
+    )
+
+    nodes.append(
+        Node(
+            package="panda_nmpc",
             executable="dynamic_sphere_obstacle_publisher",
             output="both",
             parameters=[
@@ -197,9 +250,50 @@ def generate_launch_description():
         default_value="/dynamic_sphere_obstacles",
         description="Shared dynamic sphere topic used by NMPC and MuJoCo visualization.",
     )
+    target_pose_topic = DeclareLaunchArgument(
+        "target_pose_topic",
+        default_value="/global_target_pose",
+        description="Pose topic published from the RViz interactive target marker.",
+    )
+    start_target_pose_marker = DeclareLaunchArgument(
+        "start_target_pose_marker",
+        default_value="true",
+        description="Start the RViz interactive target marker node.",
+    )
+    start_target_pose_marker_rviz = DeclareLaunchArgument(
+        "start_target_pose_marker_rviz",
+        default_value="true",
+        description="Start RViz2 with the target marker config.",
+    )
+    target_pose_marker_params_file = DeclareLaunchArgument(
+        "target_pose_marker_params_file",
+        default_value=PathJoinSubstitution(
+            [FindPackageShare("panda_nmpc"), "config", "interactive_target_marker.yaml"]
+        ),
+        description="Parameter file for the RViz interactive target marker node.",
+    )
+    target_pose_marker_rviz_config_file = DeclareLaunchArgument(
+        "target_pose_marker_rviz_config_file",
+        default_value=PathJoinSubstitution(
+            [FindPackageShare("panda_nmpc"), "rviz", "interactive_target_marker.rviz"]
+        ),
+        description="RViz2 config file used for the target pose interactive marker.",
+    )
+    start_obstacle_marker_visualizer = DeclareLaunchArgument(
+        "start_obstacle_marker_visualizer",
+        default_value="true",
+        description="Start the RViz obstacle marker visualizer node.",
+    )
+    obstacle_marker_visualizer_params_file = DeclareLaunchArgument(
+        "obstacle_marker_visualizer_params_file",
+        default_value=PathJoinSubstitution(
+            [FindPackageShare("panda_nmpc"), "config", "obstacle_marker_visualizer.yaml"]
+        ),
+        description="Parameter file for the RViz obstacle marker visualizer node.",
+    )
     start_dynamic_obstacle_publisher = DeclareLaunchArgument(
         "start_dynamic_obstacle_publisher",
-        default_value="false",
+        default_value="true",
         description="Start the demo dynamic sphere obstacle publisher together with MuJoCo simulation.",
     )
     dynamic_obstacle_publisher_params_file = DeclareLaunchArgument(
@@ -220,6 +314,13 @@ def generate_launch_description():
             headless,
             obstacle_config_path,
             dynamic_obstacle_topic,
+            target_pose_topic,
+            start_target_pose_marker,
+            start_target_pose_marker_rviz,
+            target_pose_marker_params_file,
+            target_pose_marker_rviz_config_file,
+            start_obstacle_marker_visualizer,
+            obstacle_marker_visualizer_params_file,
             start_dynamic_obstacle_publisher,
             dynamic_obstacle_publisher_params_file,
             scene_xml_path,

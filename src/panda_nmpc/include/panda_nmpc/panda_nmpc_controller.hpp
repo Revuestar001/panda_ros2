@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -46,6 +47,37 @@ struct NMPCStageReference {
     Eigen::Matrix<double, 3, 1> ee_lin_vel_ref{Eigen::Matrix<double, 3, 1>::Zero()};
     Eigen::Matrix<double, 3, 1> ee_ang_vel_ref{Eigen::Matrix<double, 3, 1>::Zero()};
     PandaNmpcObstacleParamBlock obstacle_params{};
+};
+
+struct NMPCDebugStageSlackInfo {
+    int stage{-1};
+    int slack_dim{0};
+    int active_count{0};
+    double max_slack{0.0};
+    double sum_slack{0.0};
+};
+
+struct NMPCSolveDebugInfo {
+    bool available{false};
+    bool qp_status_available{false};
+    int solver_status{-1};
+    int sqp_iter{0};
+    int qp_status{0};
+    int qp_iter{0};
+    double cost_value{std::numeric_limits<double>::quiet_NaN()};
+    double res_stat{std::numeric_limits<double>::quiet_NaN()};
+    double res_eq{std::numeric_limits<double>::quiet_NaN()};
+    double res_ineq{std::numeric_limits<double>::quiet_NaN()};
+    double res_comp{std::numeric_limits<double>::quiet_NaN()};
+    double time_tot{0.0};
+    double time_lin{0.0};
+    double time_qp{0.0};
+    int total_slack_constraints{0};
+    int active_slack_count{0};
+    int active_stage_count{0};
+    double max_slack{0.0};
+    double sum_slack{0.0};
+    std::vector<NMPCDebugStageSlackInfo> stage_slack_info{};
 };
 
 class PandaNMPCController {
@@ -130,9 +162,14 @@ public:
         nlp_dims_ = panda_task_space_nmpc_acados_get_nlp_dims(capsule_);
         nlp_in_ = panda_task_space_nmpc_acados_get_nlp_in(capsule_);
         nlp_out_ = panda_task_space_nmpc_acados_get_nlp_out(capsule_);
+        nlp_solver_ = panda_task_space_nmpc_acados_get_nlp_solver(capsule_);
+        nlp_plan_ = panda_task_space_nmpc_acados_get_nlp_plan(capsule_);
 
         N_ = PANDA_TASK_SPACE_NMPC_N;
         ocp_nlp_in_get(nlp_config_, nlp_dims_, nlp_in_, 0, "Ts", &dt_);
+        qp_status_supported_ =
+            (nlp_plan_ != nullptr) &&
+            (nlp_plan_->ocp_qp_solver_plan.qp_solver != FULL_CONDENSING_HPIPM);
 
         y_ref_.fill(0.0);
         y_ref_e_.fill(0.0);
@@ -260,6 +297,9 @@ public:
             return result;
         }
 
+        has_last_solve_ = false;
+        last_solve_status_ = result.status;
+
         std::array<double, PANDA_TASK_SPACE_NMPC_NX> x0{};
         for (int i = 0; i < 7; ++i) {
             x0[static_cast<std::size_t>(i)] = current_q(i);
@@ -286,6 +326,8 @@ public:
         resetWarmStart(current_q, current_dq);
 
         result.status = panda_task_space_nmpc_acados_solve(capsule_);
+        last_solve_status_ = result.status;
+        has_last_solve_ = true;
         if (result.status != 0) {
             has_warm_start_ = false;
             return result;
@@ -352,6 +394,76 @@ public:
 
     double getDt() const { return dt_; }
     int getN() const { return N_; }
+    NMPCSolveDebugInfo collectLastSolveDebugInfo(
+        double slack_activation_threshold = 1.0e-6,
+        bool include_stage_slack_info = false) {
+        NMPCSolveDebugInfo info;
+        if (!has_last_solve_) {
+            return info;
+        }
+
+        info.available = true;
+        info.qp_status_available = qp_status_supported_;
+        info.solver_status = last_solve_status_;
+
+        ocp_nlp_eval_cost(nlp_solver_, nlp_in_, nlp_out_);
+        ocp_nlp_eval_residuals(nlp_solver_, nlp_in_, nlp_out_);
+
+        ocp_nlp_get(nlp_solver_, "cost_value", &info.cost_value);
+        ocp_nlp_get(nlp_solver_, "sqp_iter", &info.sqp_iter);
+        if (qp_status_supported_) {
+            ocp_nlp_get(nlp_solver_, "qp_status", &info.qp_status);
+        }
+        ocp_nlp_get(nlp_solver_, "qp_iter", &info.qp_iter);
+        ocp_nlp_get(nlp_solver_, "time_tot", &info.time_tot);
+        ocp_nlp_get(nlp_solver_, "time_lin", &info.time_lin);
+        ocp_nlp_get(nlp_solver_, "time_qp", &info.time_qp);
+        ocp_nlp_get(nlp_solver_, "res_stat", &info.res_stat);
+        ocp_nlp_get(nlp_solver_, "res_eq", &info.res_eq);
+        ocp_nlp_get(nlp_solver_, "res_ineq", &info.res_ineq);
+        ocp_nlp_get(nlp_solver_, "res_comp", &info.res_comp);
+
+        for (int stage = 0; stage <= N_; ++stage) {
+            const int ns = ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, stage, "sl");
+            if (ns <= 0) {
+                continue;
+            }
+
+            std::vector<double> sl(static_cast<std::size_t>(ns), 0.0);
+            std::vector<double> su(static_cast<std::size_t>(ns), 0.0);
+            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, stage, "sl", sl.data());
+            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, stage, "su", su.data());
+
+            NMPCDebugStageSlackInfo stage_info;
+            stage_info.stage = stage;
+            stage_info.slack_dim = ns;
+
+            for (int slack_idx = 0; slack_idx < ns; ++slack_idx) {
+                const double lower_slack = std::max(0.0, sl[static_cast<std::size_t>(slack_idx)]);
+                const double upper_slack = std::max(0.0, su[static_cast<std::size_t>(slack_idx)]);
+                const double combined_slack = std::max(lower_slack, upper_slack);
+
+                stage_info.max_slack = std::max(stage_info.max_slack, combined_slack);
+                stage_info.sum_slack += lower_slack + upper_slack;
+                if (combined_slack > slack_activation_threshold) {
+                    stage_info.active_count += 1;
+                }
+            }
+
+            info.total_slack_constraints += ns;
+            info.active_slack_count += stage_info.active_count;
+            info.max_slack = std::max(info.max_slack, stage_info.max_slack);
+            info.sum_slack += stage_info.sum_slack;
+            if (stage_info.active_count > 0) {
+                info.active_stage_count += 1;
+            }
+            if (include_stage_slack_info) {
+                info.stage_slack_info.push_back(stage_info);
+            }
+        }
+
+        return info;
+    }
 
 private:
     static constexpr std::size_t kParamOffsetQNom = 12;
@@ -615,10 +727,15 @@ private:
     ocp_nlp_dims* nlp_dims_{nullptr};
     ocp_nlp_in* nlp_in_{nullptr};
     ocp_nlp_out* nlp_out_{nullptr};
+    ocp_nlp_solver* nlp_solver_{nullptr};
+    ocp_nlp_plan_t* nlp_plan_{nullptr};
 
     int N_{0};
     double dt_{0.02};
     bool has_warm_start_{false};
+    bool has_last_solve_{false};
+    bool qp_status_supported_{true};
+    int last_solve_status_{-1};
 
     std::array<double, PANDA_TASK_SPACE_NMPC_NY> y_ref_{};
     std::array<double, PANDA_TASK_SPACE_NMPC_NYN> y_ref_e_{};

@@ -1,0 +1,12 @@
+interactive_target_marker_node:
+  ros__parameters:
+    use_sim_time: true
+    frame_id: "link0"
+    target_pose_topic: "/global_target_pose"
+    marker_namespace: "/target_pose_marker"
+    marker_name: "nmpc_target_pose"
+    marker_description: "NMPC Target Pose"
+    marker_scale: 0.24
+    sphere_radius: 0.035
+    initial_position: [0.55, -0.30, 0.20]
+    initial_quaternion_xyzw: [1.0, 0.0, 0.0, 0.0]

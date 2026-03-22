@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -54,6 +56,23 @@ private:
         double radius{0.0};
     };
 
+    struct AcadosDebugLogConfig {
+        bool enabled{false};
+        double period_sec{2.0};
+        bool print_on_failure{true};
+        double slack_activation_threshold{1.0e-5};
+        bool include_stage_slack_summary{true};
+        int max_reported_stages{4};
+    };
+
+    struct TargetPoseValidationConfig {
+        bool enabled{true};
+        std::string expected_frame_id{"link0"};
+        bool allow_empty_frame_id{true};
+        double max_position_norm{2.0};
+        double min_quaternion_norm{1.0e-9};
+    };
+
     struct NodeParameters {
         std::string urdf_path;
         std::string obstacle_config_path;
@@ -83,6 +102,8 @@ private:
         double sorr_rot_max_angular_acceleration{0.7845};
 
         DynamicObstacleConfig dynamic_obstacles{};
+        AcadosDebugLogConfig acados_debug{};
+        TargetPoseValidationConfig target_pose_validation{};
 
         PandaNMPCController::CostWeights cost_weights{PandaNMPCController::defaultCostWeights()};
         PandaNMPCController::HardLimits hard_limits{PandaNMPCController::defaultHardLimits()};
@@ -121,6 +142,7 @@ private:
     bool dynamic_obstacles_ready_{false};
     DynamicObstaclePredictionMode dynamic_prediction_mode_{DynamicObstaclePredictionMode::kConstantVelocity};
     std::vector<NMPCStageReference> stage_refs_buffer_;
+    rclcpp::Time last_acados_debug_log_stamp_{0, 0, RCL_ROS_TIME};
     mutable std::mutex state_mutex_;
 
     rclcpp::Publisher<panda_interfaces::msg::ResultNMPC>::SharedPtr nmpc_res_pub_;
@@ -249,6 +271,23 @@ private:
         params_.sorr_rot_max_angular_acceleration =
             this->declare_parameter<double>("sorr_rot_max_angular_acceleration", params_.sorr_rot_max_angular_acceleration);
 
+        params_.target_pose_validation.enabled =
+            this->declare_parameter<bool>("target_pose_validation.enabled", params_.target_pose_validation.enabled);
+        params_.target_pose_validation.expected_frame_id = this->declare_parameter<std::string>(
+            "target_pose_validation.expected_frame_id", params_.target_pose_validation.expected_frame_id);
+        params_.target_pose_validation.allow_empty_frame_id = this->declare_parameter<bool>(
+            "target_pose_validation.allow_empty_frame_id", params_.target_pose_validation.allow_empty_frame_id);
+        params_.target_pose_validation.max_position_norm = this->declare_parameter<double>(
+            "target_pose_validation.max_position_norm", params_.target_pose_validation.max_position_norm);
+        params_.target_pose_validation.min_quaternion_norm = this->declare_parameter<double>(
+            "target_pose_validation.min_quaternion_norm", params_.target_pose_validation.min_quaternion_norm);
+        if (params_.target_pose_validation.max_position_norm <= 0.0) {
+            throw std::runtime_error("Parameter 'target_pose_validation.max_position_norm' must be > 0.");
+        }
+        if (params_.target_pose_validation.min_quaternion_norm <= 0.0) {
+            throw std::runtime_error("Parameter 'target_pose_validation.min_quaternion_norm' must be > 0.");
+        }
+
         params_.dynamic_obstacles.enabled =
             this->declare_parameter<bool>("dynamic_obstacles.enabled", params_.dynamic_obstacles.enabled);
         params_.dynamic_obstacles.topic =
@@ -261,6 +300,27 @@ private:
             this->declare_parameter<double>("dynamic_obstacles.timeout_sec", params_.dynamic_obstacles.timeout_sec));
         dynamic_prediction_mode_ =
             parseDynamicObstaclePredictionMode(params_.dynamic_obstacles.prediction_mode);
+
+        params_.acados_debug.enabled =
+            this->declare_parameter<bool>("debug.acados.enabled", params_.acados_debug.enabled);
+        params_.acados_debug.period_sec = std::max(
+            0.1,
+            this->declare_parameter<double>("debug.acados.period_sec", params_.acados_debug.period_sec));
+        params_.acados_debug.print_on_failure =
+            this->declare_parameter<bool>("debug.acados.print_on_failure", params_.acados_debug.print_on_failure);
+        params_.acados_debug.slack_activation_threshold = std::max(
+            0.0,
+            this->declare_parameter<double>(
+                "debug.acados.slack_activation_threshold",
+                params_.acados_debug.slack_activation_threshold));
+        params_.acados_debug.include_stage_slack_summary = this->declare_parameter<bool>(
+            "debug.acados.include_stage_slack_summary",
+            params_.acados_debug.include_stage_slack_summary);
+        const auto max_reported_stages = this->declare_parameter<int64_t>(
+            "debug.acados.max_reported_stages",
+            static_cast<int64_t>(params_.acados_debug.max_reported_stages));
+        params_.acados_debug.max_reported_stages =
+            static_cast<int>(std::max<int64_t>(1, max_reported_stages));
 
         const auto default_weights = PandaNMPCController::defaultCostWeights();
         params_.cost_weights.pos = declareFixedSizeArrayParameter("nmpc_weights.stage.pos", default_weights.pos);
@@ -497,6 +557,115 @@ private:
         return stage_refs_buffer_;
     }
 
+    bool shouldLogAcadosDebug(const int solve_status) const {
+        const bool periodic_logging_enabled = params_.acados_debug.enabled;
+        const bool failure_logging_enabled =
+            params_.acados_debug.print_on_failure && solve_status != 0;
+        if (!periodic_logging_enabled && !failure_logging_enabled) {
+            return false;
+        }
+
+        if (last_acados_debug_log_stamp_.nanoseconds() == 0) {
+            return true;
+        }
+
+        return (this->now() - last_acados_debug_log_stamp_).seconds() >=
+               params_.acados_debug.period_sec;
+    }
+
+    void maybeLogAcadosDebug(const int solve_status) {
+        if (!shouldLogAcadosDebug(solve_status)) {
+            return;
+        }
+
+        NMPCSolveDebugInfo debug_info = nmpc_solver_.collectLastSolveDebugInfo(
+            params_.acados_debug.slack_activation_threshold,
+            params_.acados_debug.include_stage_slack_summary);
+        if (!debug_info.available) {
+            return;
+        }
+
+        last_acados_debug_log_stamp_ = this->now();
+
+        std::ostringstream stream;
+        stream << std::fixed << std::setprecision(4);
+        stream << "Acados debug: status=" << debug_info.solver_status
+               << ", sqp_iter=" << debug_info.sqp_iter
+               << ", qp_status=";
+        if (debug_info.qp_status_available) {
+            stream << debug_info.qp_status;
+        } else {
+            stream << "n/a";
+        }
+        stream
+               << ", qp_iter=" << debug_info.qp_iter
+               << ", cost=";
+        if (std::isfinite(debug_info.cost_value)) {
+            stream << debug_info.cost_value;
+        } else {
+            stream << "nan";
+        }
+        stream << ", residuals=[stat=" << debug_info.res_stat
+               << ", eq=" << debug_info.res_eq
+               << ", ineq=" << debug_info.res_ineq
+               << ", comp=" << debug_info.res_comp
+               << "], time_ms=[tot=" << (1.0e3 * debug_info.time_tot)
+               << ", lin=" << (1.0e3 * debug_info.time_lin)
+               << ", qp=" << (1.0e3 * debug_info.time_qp)
+               << "], soft=[active=" << debug_info.active_slack_count
+               << "/" << debug_info.total_slack_constraints
+               << ", stages=" << debug_info.active_stage_count
+               << "/" << (nmpc_solver_.getN() + 1)
+               << ", max=" << debug_info.max_slack
+               << ", sum=" << debug_info.sum_slack
+               << ", threshold=" << params_.acados_debug.slack_activation_threshold
+               << "]";
+
+        if (params_.acados_debug.include_stage_slack_summary &&
+            !debug_info.stage_slack_info.empty()) {
+            auto stage_slack_info = debug_info.stage_slack_info;
+            std::sort(
+                stage_slack_info.begin(),
+                stage_slack_info.end(),
+                [](const NMPCDebugStageSlackInfo& lhs, const NMPCDebugStageSlackInfo& rhs) {
+                    if (lhs.max_slack != rhs.max_slack) {
+                        return lhs.max_slack > rhs.max_slack;
+                    }
+                    return lhs.stage < rhs.stage;
+                });
+
+            int reported_stage_count = 0;
+            stream << ", top_soft_stages=";
+            for (const auto& stage_info : stage_slack_info) {
+                if (stage_info.max_slack <= params_.acados_debug.slack_activation_threshold &&
+                    stage_info.active_count == 0) {
+                    continue;
+                }
+                if (reported_stage_count > 0) {
+                    stream << "; ";
+                }
+                stream << "k=" << stage_info.stage
+                       << " max=" << stage_info.max_slack
+                       << " sum=" << stage_info.sum_slack
+                       << " active=" << stage_info.active_count
+                       << "/" << stage_info.slack_dim;
+                ++reported_stage_count;
+                if (reported_stage_count >= params_.acados_debug.max_reported_stages) {
+                    break;
+                }
+            }
+            if (reported_stage_count == 0) {
+                stream << "none";
+            }
+        }
+
+        if (solve_status == 0) {
+            RCLCPP_INFO(this->get_logger(), "%s", stream.str().c_str());
+        } else {
+            RCLCPP_WARN(this->get_logger(), "%s", stream.str().c_str());
+        }
+    }
+
     void publishResult(const NMPCResult& result) {
         panda_interfaces::msg::ResultNMPC msg;
         Eigen::Map<Vec7>(msg.q_ref.data()) = result.q_ref;
@@ -571,6 +740,8 @@ private:
             q_meas,
             dq_meas);
 
+        maybeLogAcadosDebug(result.status);
+
         if (result.status == 0) {
             consecutive_failure_count_ = 0;
             last_valid_result_ = result;
@@ -640,18 +811,75 @@ private:
     }
 
     void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+        const Vec3 position(
+            msg->pose.position.x,
+            msg->pose.position.y,
+            msg->pose.position.z);
         const Quat quat(
             msg->pose.orientation.w,
             msg->pose.orientation.x,
             msg->pose.orientation.y,
             msg->pose.orientation.z);
-        if (quat.norm() < 1.0e-9) {
-            RCLCPP_WARN(this->get_logger(), "Received invalid target quaternion, ignoring orientation update.");
+
+        const auto finite = [](double value) { return std::isfinite(value); };
+        if (!finite(position.x()) || !finite(position.y()) || !finite(position.z())) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Received invalid target pose with non-finite position. Ignoring message.");
+            return;
+        }
+        if (!finite(quat.w()) || !finite(quat.x()) || !finite(quat.y()) || !finite(quat.z())) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Received invalid target pose with non-finite quaternion. Ignoring message.");
+            return;
+        }
+
+        if (params_.target_pose_validation.enabled) {
+            const auto& validation = params_.target_pose_validation;
+            if (!msg->header.frame_id.empty() && !validation.expected_frame_id.empty() &&
+                msg->header.frame_id != validation.expected_frame_id) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Received target pose in frame '%s' but expected '%s'. Ignoring message.",
+                    msg->header.frame_id.c_str(),
+                    validation.expected_frame_id.c_str());
+                return;
+            }
+
+            if (msg->header.frame_id.empty() && !validation.allow_empty_frame_id) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Received target pose with empty frame_id while target_pose_validation.allow_empty_frame_id=false. Ignoring message.");
+                return;
+            }
+
+            if (position.norm() > validation.max_position_norm) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Received target pose with position norm %.3f > %.3f. Ignoring message.",
+                    position.norm(),
+                    validation.max_position_norm);
+                return;
+            }
+
+            if (quat.norm() < validation.min_quaternion_norm) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Received invalid target quaternion with norm %.3e < %.3e. Ignoring message.",
+                    quat.norm(),
+                    validation.min_quaternion_norm);
+                return;
+            }
+        } else if (quat.norm() < 1.0e-9) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Received invalid target quaternion, ignoring message.");
             return;
         }
 
         std::lock_guard<std::mutex> lock(state_mutex_);
-        target_pos_ << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
+        target_pos_ = position;
         target_rot_ = quat.normalized().toRotationMatrix();
     }
 
@@ -799,7 +1027,7 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "NMPC single-pose node started. urdf=%s, ee_frame=%s, static_obstacle_source=%s, dynamic_obstacles=%s, dynamic_topic=%s, dynamic_prediction=%s, joint_states_topic=%s, target_pose_topic=%s, result_topic=%s, joint_trajectory_topic=%s (ignored), use_global_trajectory=%s (ignored), executor=MultiThreadedExecutor",
+            "NMPC single-pose node started. urdf=%s, ee_frame=%s, static_obstacle_source=%s, dynamic_obstacles=%s, dynamic_topic=%s, dynamic_prediction=%s, joint_states_topic=%s, target_pose_topic=%s, result_topic=%s, joint_trajectory_topic=%s (ignored), use_global_trajectory=%s (ignored), acados_debug=%s, executor=MultiThreadedExecutor",
             params_.urdf_path.c_str(),
             params_.ee_frame_name.c_str(),
             selectObstacleSourcePath().c_str(),
@@ -810,7 +1038,8 @@ public:
             params_.target_pose_topic.c_str(),
             params_.nmpc_result_topic.c_str(),
             params_.joint_trajectory_topic.c_str(),
-            params_.use_global_trajectory ? "true" : "false");
+            params_.use_global_trajectory ? "true" : "false",
+            params_.acados_debug.enabled ? "enabled" : "disabled");
     }
 };
 

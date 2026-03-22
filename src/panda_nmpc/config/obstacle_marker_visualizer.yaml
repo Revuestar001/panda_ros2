@@ -1,0 +1,11 @@
+obstacle_marker_visualizer_node:
+  ros__parameters:
+    use_sim_time: true
+    frame_id: "link0"
+    obstacle_config_path: "/home/cyh/panda_ros2/model/franka_emika_panda/static_sphere_obstacles.xml"
+    dynamic_obstacle_topic: "/dynamic_sphere_obstacles"
+    marker_topic: "/obstacle_markers"
+    publish_rate_hz: 15.0
+    dynamic_timeout_sec: 0.5
+    static_rgba: [1.0, 0.2, 0.2, 0.55]
+    dynamic_rgba: [0.15, 0.85, 1.0, 0.60]

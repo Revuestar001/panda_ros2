@@ -11,11 +11,13 @@
 
   <depend>ament_index_cpp</depend>
   <depend>geometry_msgs</depend>
+  <depend>interactive_markers</depend>
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>tinyxml2_vendor</depend>
+  <depend>visualization_msgs</depend>
 
   <depend>panda_interfaces</depend>
 

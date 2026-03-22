@@ -1,0 +1,85 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /RobotModel1
+        - /InteractiveMarkers1
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/RobotModel
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+      Enabled: true
+      Name: RobotModel
+      Value: true
+      Visual Enabled: true
+      Collision Enabled: false
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Obstacles
+      Namespaces:
+        dynamic_obstacles: true
+        static_obstacles: true
+      Topic:
+        Depth: 100
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /obstacle_markers
+      Value: true
+    - Class: rviz_default_plugins/InteractiveMarkers
+      Enable Transparency: true
+      Enabled: true
+      Interactive Markers Namespace: /target_pose_marker
+      Name: InteractiveMarkers
+      Show Axes: true
+      Show Descriptions: true
+      Show Visual Aids: true
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: link0
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2.0
+      Focal Point:
+        X: -0.1
+        Y: 0.25
+        Z: 0.30
+      Name: Current View
+      Pitch: 0.5
+      Target Frame: link0
+      Yaw: -0.62
+Window Geometry:
+  Height: 900
+  Width: 1280

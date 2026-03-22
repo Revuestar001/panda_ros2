@@ -12,9 +12,9 @@ nmpc_tau_node:
     nmpc_result_topic: "/nmpc_result"
     target_pose_topic: "/global_target_pose"
 
-    target_x: 0.55
-    target_y: -0.30
-    target_z: 0.30
+    target_x: 0.25
+    target_y: 0.00
+    target_z: 0.25
     target_qx: 1.0
     target_qy: 0.0
     target_qz: 0.0
@@ -34,11 +34,27 @@ nmpc_tau_node:
     sorr_rot_max_angular_velocity: 0.07845
     sorr_rot_max_angular_acceleration: 0.7845
 
+    target_pose_validation:
+      enabled: true
+      expected_frame_id: "link0"
+      allow_empty_frame_id: true
+      max_position_norm: 2.0
+      min_quaternion_norm: 1.0e-9
+
     dynamic_obstacles:
       enabled: true
       topic: "/dynamic_sphere_obstacles"
       prediction_mode: "constant_velocity"
       timeout_sec: 0.2
+
+    debug:
+      acados:
+        enabled: true
+        period_sec: 1.0
+        print_on_failure: true
+        slack_activation_threshold: 1.0e-3
+        include_stage_slack_summary: true
+        max_reported_stages: 4
 
     nominal_posture:
       q: [0.0, 0.0, 0.0, -1.5708, 0.0, 1.8675, 0.0]
@@ -71,7 +87,7 @@ nmpc_tau_node:
     obstacle_constraint:
       stage:
         slack_linear: 0.0
-        slack_quadratic: 10000.0
+        slack_quadratic: 1000000.0
       terminal:
         slack_linear: 0.0
-        slack_quadratic: 10000.0
+        slack_quadratic: 1000000.0

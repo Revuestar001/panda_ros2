@@ -9,12 +9,14 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(interactive_markers REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(tinyxml2_vendor REQUIRED)
 find_package(TinyXML2 REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
 
@@ -95,6 +97,14 @@ add_executable(dynamic_sphere_obstacle_publisher
   src/dynamic_sphere_obstacle_publisher.cpp
 )
 
+add_executable(interactive_target_marker_node
+  src/interactive_target_marker_node.cpp
+)
+
+add_executable(obstacle_marker_visualizer_node
+  src/obstacle_marker_visualizer_node.cpp
+)
+
 # 包含所有的头文件路径
 target_include_directories(nmpc_tau PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -113,9 +123,21 @@ target_include_directories(dynamic_sphere_obstacle_publisher PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
+target_include_directories(interactive_target_marker_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+target_include_directories(obstacle_marker_visualizer_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
 target_compile_features(nmpc_tau PUBLIC c_std_99 cxx_std_17) 
 target_compile_features(nmpc_tau_original PUBLIC c_std_99 cxx_std_17)
 target_compile_features(dynamic_sphere_obstacle_publisher PUBLIC cxx_std_17)
+target_compile_features(interactive_target_marker_node PUBLIC cxx_std_17)
+target_compile_features(obstacle_marker_visualizer_node PUBLIC cxx_std_17)
 
 # 3. 链接目标与库
 ament_target_dependencies(nmpc_tau 
@@ -142,6 +164,23 @@ ament_target_dependencies(nmpc_tau_original
 ament_target_dependencies(dynamic_sphere_obstacle_publisher
   "rclcpp"
   panda_interfaces
+)
+
+ament_target_dependencies(interactive_target_marker_node
+  "geometry_msgs"
+  interactive_markers
+  "rclcpp"
+  visualization_msgs
+)
+
+ament_target_dependencies(obstacle_marker_visualizer_node
+  "rclcpp"
+  panda_interfaces
+  visualization_msgs
+)
+target_link_libraries(obstacle_marker_visualizer_node
+  Eigen3::Eigen
+  tinyxml2::tinyxml2
 )
 
 # 链接 Acados 库和生成的求解器动态库
@@ -183,6 +222,12 @@ install(TARGETS nmpc_tau nmpc_tau_original
 install(TARGETS dynamic_sphere_obstacle_publisher
   DESTINATION lib/${PROJECT_NAME})
 
+install(TARGETS interactive_target_marker_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS obstacle_marker_visualizer_node
+  DESTINATION lib/${PROJECT_NAME})
+
 install(TARGETS panda_task_space_nmpc_generated_solver
   DESTINATION lib/${PROJECT_NAME}/c_generated_code)
 
@@ -194,6 +239,7 @@ install(PROGRAMS
 install(DIRECTORY
   launch
   config
+  rviz
   DESTINATION share/${PROJECT_NAME}
 )
 
