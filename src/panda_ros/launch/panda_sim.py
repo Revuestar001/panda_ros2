@@ -94,7 +94,7 @@ def launch_setup(context, *args, **kwargs):
         [
             PathJoinSubstitution([FindExecutable(name="xacro")]),
             " ",
-            PathJoinSubstitution([pkg_share, "model", "panda_tau_sim.urdf"]),
+            PathJoinSubstitution([pkg_share, "model", "panda_tau_sim_no_sphere_collision.urdf"]),
             " headless:=",
             LaunchConfiguration("headless"),
             " use_mjcf_from_topic:=false",
