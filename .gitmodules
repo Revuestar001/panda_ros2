@@ -1,0 +1,4 @@
+[submodule "src/mujoco_ros2_control"]
+	path = src/mujoco_ros2_control
+	url = https://github.com/Revuestar001/mujoco_ros2_control.git
+	branch = simple-path-sphere-demo
