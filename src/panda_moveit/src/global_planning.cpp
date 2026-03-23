@@ -84,7 +84,18 @@ private:
     std::uint64_t revision{0};
   };
 
-  static constexpr const char* kRequiredPlannerId = "RRTstarkConfigDefault";
+  static constexpr const char* kRrtStarPlannerId = "RRTstarkConfigDefault";
+  static constexpr const char* kRrtConnectPlannerId = "RRTConnectkConfigDefault";
+
+  std::string plannerDisplayName() const {
+    if (planner_id_ == kRrtStarPlannerId) {
+      return "RRTstar";
+    }
+    if (planner_id_ == kRrtConnectPlannerId) {
+      return "RRTConnect";
+    }
+    return planner_id_;
+  }
 
   static double quaternionAngularDistance(
       const geometry_msgs::msg::Quaternion& a_msg,
@@ -129,7 +140,7 @@ private:
 
     planning_time_ = declare_parameter<double>("planning_time", 3.0);
     num_planning_attempts_ = declare_parameter<int>("num_planning_attempts", 1);
-    planner_id_ = declare_parameter<std::string>("planner_id", kRequiredPlannerId);
+    planner_id_ = declare_parameter<std::string>("planner_id", "rrt_star");
 
     max_multi_plan_rounds_ = declare_parameter<int>("max_multi_plan_rounds", 20);
     min_rounds_before_early_stop_ = declare_parameter<int>("min_rounds_before_early_stop", 3);
@@ -185,14 +196,25 @@ private:
   }
 
   void sanitizePlannerSelection() {
-    if (planner_id_ != kRequiredPlannerId) {
-      RCLCPP_WARN(
-          get_logger(),
-          "Planner '%s' is not allowed. Overriding to '%s' because this node only supports RRT*.",
-          planner_id_.c_str(),
-          kRequiredPlannerId);
-      planner_id_ = kRequiredPlannerId;
+    if (planner_id_ == "rrt_star" || planner_id_ == "RRTstar" ||
+        planner_id_ == "RRTstarkConfigDefault") {
+      planner_id_ = kRrtStarPlannerId;
+      return;
     }
+
+    if (planner_id_ == "rrt_connect" || planner_id_ == "RRTConnect" ||
+        planner_id_ == "RRTConnectkConfigDefault") {
+      planner_id_ = kRrtConnectPlannerId;
+      return;
+    }
+
+    RCLCPP_WARN(
+        get_logger(),
+        "Planner '%s' is not supported. Falling back to '%s'. Allowed values are "
+        "'rrt_star' and 'rrt_connect'.",
+        planner_id_.c_str(),
+        kRrtStarPlannerId);
+    planner_id_ = kRrtStarPlannerId;
   }
 
   std::string selectObstacleSourcePath() const {
@@ -821,8 +843,9 @@ private:
     if (!best_candidate.valid) {
       RCLCPP_WARN(
           get_logger(),
-          "MoveIt planning failed after %d RRT* round(s) for target revision=%llu in frame '%s'.",
+          "MoveIt planning failed after %d %s round(s) for target revision=%llu in frame '%s'.",
           max_multi_plan_rounds_,
+          plannerDisplayName().c_str(),
           static_cast<unsigned long long>(revision),
           pose_for_planning.header.frame_id.c_str());
       return false;
@@ -860,7 +883,8 @@ private:
     const auto total_duration = trajectory.points.back().time_from_start;
     RCLCPP_INFO(
         get_logger(),
-        "Published RRT* trajectory for revision=%llu: points=%zu, duration=%.3f s, terminal_pos_err=%.6f m, terminal_rot_err=%.6f rad, joint_path_len=%.6f, successful_rounds=%d/%d, ik_mode=%s",
+        "Published %s trajectory for revision=%llu: points=%zu, duration=%.3f s, terminal_pos_err=%.6f m, terminal_rot_err=%.6f rad, joint_path_len=%.6f, successful_rounds=%d/%d, ik_mode=%s",
+        plannerDisplayName().c_str(),
         static_cast<unsigned long long>(revision),
         trajectory.points.size(),
         rclcpp::Duration(total_duration).seconds(),

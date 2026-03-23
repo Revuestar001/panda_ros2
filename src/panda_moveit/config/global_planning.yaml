@@ -3,7 +3,7 @@ global_planning_node:
     use_sim_time: true
 
     planning_group: "panda_arm"
-    planner_id: "RRTstarkConfigDefault"
+    planner_id: "rrt_connect"
 
     target_topic: "/global_target_pose"
     trajectory_topic: "/global_joint_trajectory"
